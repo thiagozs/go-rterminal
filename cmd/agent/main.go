@@ -50,7 +50,7 @@ func run() error {
 	for {
 		var msg Message
 		if err := ctrl.ReadJSON(&msg); err != nil {
-			return err // 🔑 força reconexão
+			return err // força reconexão
 		}
 
 		if msg.Type == "start-session" {
@@ -80,7 +80,7 @@ func startShell(sessionID string) {
 		return
 	}
 
-	// PTY → WS
+	// PTY --> WS
 	go func() {
 		buf := make([]byte, 4096)
 		for {
@@ -92,7 +92,7 @@ func startShell(sessionID string) {
 		}
 	}()
 
-	// WS → PTY
+	// WS --> PTY
 	go func() {
 		for {
 			_, data, err := ws.ReadMessage()
@@ -107,7 +107,7 @@ func startShell(sessionID string) {
 	err = cmd.Wait()
 	log.Printf("[agent] shell encerrado | session=%s | err=%v", sessionID, err)
 
-	// 🔑 fecha websocket da sessão (desbloqueia client)
+	// fecha websocket da sessão (desbloqueia client)
 	ws.WriteMessage(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(

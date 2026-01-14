@@ -14,7 +14,7 @@ import (
 func main() {
 	log.Println("[client] solicitando nova sessão")
 
-	// 1️⃣ solicita nova sessão ao server
+	// 1) solicita nova sessão ao server
 	resp, err := http.Get("http://127.0.0.1:8080/client?agent=agent-01")
 	if err != nil {
 		log.Fatal("[client] erro ao criar sessão:", err)
@@ -26,7 +26,7 @@ func main() {
 
 	log.Println("[client] sessão criada:", sessionID)
 
-	// 2️⃣ conecta no websocket da sessão
+	// 2) conecta no websocket da sessão
 	ws, _, err := websocket.DefaultDialer.Dial(
 		"ws://127.0.0.1:8080/session?id="+sessionID,
 		nil,
@@ -38,7 +38,7 @@ func main() {
 
 	log.Println("[client] conectado à sessão")
 
-	// 3️⃣ coloca terminal em raw mode
+	// 3) coloca terminal em raw mode
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
@@ -48,7 +48,7 @@ func main() {
 
 	done := make(chan struct{})
 
-	// 4️⃣ stdin → websocket
+	// 4) stdin --> websocket
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -68,7 +68,7 @@ func main() {
 		}
 	}()
 
-	// 5️⃣ websocket → stdout
+	// 5) websocket --> stdout
 	go func() {
 		for {
 			mt, data, err := ws.ReadMessage()
@@ -91,10 +91,10 @@ func main() {
 		}
 	}()
 
-	// 6️⃣ aguarda encerramento
+	// 6)aguarda encerramento
 	<-done
 
-	// 7️⃣ restaura terminal e imprime mensagem final
+	// 7) restaura terminal e imprime mensagem final
 	term.Restore(fd, oldState)
 	os.Stdout.WriteString("\r\n[client] sessão encerrada.\r\n")
 }
