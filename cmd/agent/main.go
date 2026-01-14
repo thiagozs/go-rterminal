@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"errors"
 	"log"
 	"os/exec"
@@ -84,7 +85,7 @@ func runShellSession(conn *websocket.Conn) error {
 	var once sync.Once
 	closeDone := func() { once.Do(func() { close(done) }) }
 
-	// PTY → WS
+	// PTY -> WS
 	go func() {
 		buf := make([]byte, 1024)
 		for {
@@ -100,14 +101,32 @@ func runShellSession(conn *websocket.Conn) error {
 		}
 	}()
 
-	// WS → PTY
+	// WS -> PTY (dados + controle)
 	go func() {
 		for {
-			_, data, err := conn.ReadMessage()
+			mt, data, err := conn.ReadMessage()
 			if err != nil {
 				closeDone()
 				return
 			}
+
+			// controle
+			if mt == websocket.TextMessage {
+				var msg protocol.Message
+				if err := json.Unmarshal(data, &msg); err != nil {
+					continue
+				}
+
+				if msg.Type == "resize" {
+					pty.Setsize(ptmx, &pty.Winsize{
+						Cols: msg.Cols,
+						Rows: msg.Rows,
+					})
+				}
+				continue
+			}
+
+			// dados
 			if _, err := ptmx.Write(data); err != nil {
 				closeDone()
 				return

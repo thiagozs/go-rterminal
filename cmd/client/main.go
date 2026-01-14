@@ -2,18 +2,30 @@ package main
 
 import (
 	"encoding/json"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
 	"syscall"
 
 	"github.com/gorilla/websocket"
+	"github.com/thiagozs/go-shellhub/internal/protocol"
 	"golang.org/x/term"
 )
 
-type ControlMessage struct {
-	Type string `json:"type"`
+func sendResize(ws *websocket.Conn) {
+	cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
+	if err != nil {
+		return
+	}
+
+	msg := protocol.Message{
+		Type: "resize",
+		Cols: uint16(cols),
+		Rows: uint16(rows),
+	}
+
+	data, _ := json.Marshal(msg)
+	_ = ws.WriteMessage(websocket.TextMessage, data)
 }
 
 func main() {
@@ -35,29 +47,27 @@ func main() {
 
 	done := make(chan struct{})
 
-	// sinais do SO
+	// sinais
 	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM)
+	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
 
-	// stdin → websocket
+	// resize inicial
+	sendResize(ws)
+
+	// stdin → ws
 	go func() {
 		buf := make([]byte, 1024)
 		for {
-			select {
-			case <-done:
+			n, err := os.Stdin.Read(buf)
+			if err != nil {
+				close(done)
 				return
-			default:
-				n, err := os.Stdin.Read(buf)
-				if err != nil {
-					close(done)
-					return
-				}
-				ws.WriteMessage(websocket.BinaryMessage, buf[:n])
 			}
+			_ = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
 		}
 	}()
 
-	// websocket → terminal
+	// ws → terminal
 	go func() {
 		for {
 			mt, data, err := ws.ReadMessage()
@@ -71,11 +81,12 @@ func main() {
 				os.Stdout.Write(data)
 
 			case websocket.TextMessage:
-				var ctrl ControlMessage
-				if err := json.Unmarshal(data, &ctrl); err != nil {
+				var msg protocol.Message
+				if err := json.Unmarshal(data, &msg); err != nil {
 					continue
 				}
-				if ctrl.Type == "end-session" {
+
+				if msg.Type == "end-session" {
 					close(done)
 					return
 				}
@@ -83,13 +94,22 @@ func main() {
 		}
 	}()
 
-	// aguarda fim
-	select {
-	case <-done:
-	case <-sig:
+	for {
+		select {
+		case s := <-sig:
+			if s == syscall.SIGWINCH {
+				sendResize(ws)
+			} else {
+				close(done)
+				goto exit
+			}
+
+		case <-done:
+			goto exit
+		}
 	}
 
-	// fecha websocket corretamente
+exit:
 	_ = ws.WriteMessage(
 		websocket.CloseMessage,
 		websocket.FormatCloseMessage(
@@ -98,5 +118,9 @@ func main() {
 		),
 	)
 
-	fmt.Printf("\nSession closed.")
+	// 🔑 RESTAURA TERMINAL PRIMEIRO
+	term.Restore(fd, oldState)
+
+	// 🔑 PRINT LIMPO
+	os.Stdout.WriteString("\r\nSession closed.\r\n")
 }
