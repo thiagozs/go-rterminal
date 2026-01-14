@@ -1,126 +1,100 @@
 package main
 
 import (
-	"encoding/json"
+	"io"
 	"log"
+	"net/http"
 	"os"
-	"os/signal"
-	"syscall"
+	"strings"
 
 	"github.com/gorilla/websocket"
-	"github.com/thiagozs/go-shellhub/internal/protocol"
 	"golang.org/x/term"
 )
 
-func sendResize(ws *websocket.Conn) {
-	cols, rows, err := term.GetSize(int(os.Stdout.Fd()))
-	if err != nil {
-		return
-	}
-
-	msg := protocol.Message{
-		Type: "resize",
-		Cols: uint16(cols),
-		Rows: uint16(rows),
-	}
-
-	data, _ := json.Marshal(msg)
-	_ = ws.WriteMessage(websocket.TextMessage, data)
-}
-
 func main() {
+	log.Println("[client] solicitando nova sessão")
+
+	// 1️⃣ solicita nova sessão ao server
+	resp, err := http.Get("http://127.0.0.1:8080/client?agent=agent-01")
+	if err != nil {
+		log.Fatal("[client] erro ao criar sessão:", err)
+	}
+	defer resp.Body.Close()
+
+	sessionIDBytes, _ := io.ReadAll(resp.Body)
+	sessionID := strings.TrimSpace(string(sessionIDBytes))
+
+	log.Println("[client] sessão criada:", sessionID)
+
+	// 2️⃣ conecta no websocket da sessão
 	ws, _, err := websocket.DefaultDialer.Dial(
-		"ws://127.0.0.1:8080/client?agent=agent-01",
+		"ws://127.0.0.1:8080/session?id="+sessionID,
 		nil,
 	)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("[client] erro ao conectar sessão:", err)
 	}
 	defer ws.Close()
 
+	log.Println("[client] conectado à sessão")
+
+	// 3️⃣ coloca terminal em raw mode
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		log.Fatal(err)
+		log.Fatal("[client] erro ao ativar raw mode:", err)
 	}
 	defer term.Restore(fd, oldState)
 
 	done := make(chan struct{})
 
-	// sinais
-	sig := make(chan os.Signal, 1)
-	signal.Notify(sig, syscall.SIGINT, syscall.SIGTERM, syscall.SIGWINCH)
-
-	// resize inicial
-	sendResize(ws)
-
-	// stdin → ws
+	// 4️⃣ stdin → websocket
 	go func() {
 		buf := make([]byte, 1024)
 		for {
 			n, err := os.Stdin.Read(buf)
 			if err != nil {
+				log.Println("[client] stdin fechado")
 				close(done)
 				return
 			}
-			_ = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+
+			err = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
+			if err != nil {
+				log.Println("[client] erro ao enviar stdin:", err)
+				close(done)
+				return
+			}
 		}
 	}()
 
-	// ws → terminal
+	// 5️⃣ websocket → stdout
 	go func() {
 		for {
 			mt, data, err := ws.ReadMessage()
 			if err != nil {
+				log.Println("[client] sessão encerrada pelo server")
 				close(done)
 				return
 			}
 
 			switch mt {
+
 			case websocket.BinaryMessage:
-				os.Stdout.Write(data)
+				_, _ = os.Stdout.Write(data)
 
-			case websocket.TextMessage:
-				var msg protocol.Message
-				if err := json.Unmarshal(data, &msg); err != nil {
-					continue
-				}
-
-				if msg.Type == "end-session" {
-					close(done)
-					return
-				}
+			case websocket.CloseMessage:
+				log.Println("[client] shell finalizado")
+				close(done)
+				return
 			}
 		}
 	}()
 
-	for {
-		select {
-		case s := <-sig:
-			if s == syscall.SIGWINCH {
-				sendResize(ws)
-			} else {
-				close(done)
-				goto exit
-			}
+	// 6️⃣ aguarda encerramento
+	<-done
 
-		case <-done:
-			goto exit
-		}
-	}
-
-exit:
-	_ = ws.WriteMessage(
-		websocket.CloseMessage,
-		websocket.FormatCloseMessage(
-			websocket.CloseNormalClosure,
-			"client closed",
-		),
-	)
-
-	// 🔑 RESTAURA TERMINAL PRIMEIRO
+	// 7️⃣ restaura terminal e imprime mensagem final
 	term.Restore(fd, oldState)
-
-	// 🔑 PRINT LIMPO
-	os.Stdout.WriteString("\r\nSession closed.\r\n")
+	os.Stdout.WriteString("\r\n[client] sessão encerrada.\r\n")
 }

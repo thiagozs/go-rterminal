@@ -5,88 +5,117 @@ import (
 	"net/http"
 	"sync"
 
+	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
-	"github.com/thiagozs/go-shellhub/internal/protocol"
 )
 
+type Message struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+type Session struct {
+	ID   string
+	Once sync.Once
+}
+
+var upgrader = websocket.Upgrader{
+	CheckOrigin: func(r *http.Request) bool { return true },
+}
+
 var (
-	upgrader = websocket.Upgrader{
-		CheckOrigin: func(r *http.Request) bool { return true },
-	}
-	agents sync.Map // agentID -> *websocket.Conn
+	agents   sync.Map // agentID -> *websocket.Conn
+	sessions sync.Map // sessionID -> chan *websocket.Conn (pairing)
 )
 
 func agentHandler(w http.ResponseWriter, r *http.Request) {
-	conn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
+	ws, _ := upgrader.Upgrade(w, r, nil)
 
-	var msg protocol.Message
-	if err := conn.ReadJSON(&msg); err != nil || msg.Type != "register" {
-		log.Println("Registro inválido de agent")
-		conn.Close()
-		return
-	}
+	var msg Message
+	ws.ReadJSON(&msg)
 
-	log.Println("Agent conectado:", msg.AgentID)
-	agents.Store(msg.AgentID, conn)
+	agents.Store(msg.SessionID, ws)
+	log.Println("Agent conectado:", msg.SessionID)
 
-	// O relay será responsável por consumir esse socket
+	select {} // mantém vivo
 }
 
 func clientHandler(w http.ResponseWriter, r *http.Request) {
 	agentID := r.URL.Query().Get("agent")
 	val, ok := agents.Load(agentID)
 	if !ok {
-		http.Error(w, "agent offline", http.StatusNotFound)
+		http.Error(w, "agent offline", 404)
 		return
 	}
 
-	clientConn, err := upgrader.Upgrade(w, r, nil)
-	if err != nil {
-		return
-	}
+	sessionID := uuid.NewString()
+	ch := make(chan *websocket.Conn, 2)
+	sessions.Store(sessionID, ch)
 
-	agentConn := val.(*websocket.Conn)
-
-	log.Println("Cliente conectado ao agent:", agentID)
-
-	// AVISA O AGENT PARA INICIAR UMA NOVA SESSÃO
-	err = agentConn.WriteJSON(protocol.Message{
-		Type: "start-session",
+	// avisa o agent
+	val.(*websocket.Conn).WriteJSON(Message{
+		Type:      "start-session",
+		SessionID: sessionID,
 	})
-	if err != nil {
-		log.Println("Erro ao iniciar sessão:", err)
-		clientConn.Close()
-		return
-	}
 
-	// relay de dados
-	go relay(clientConn, agentConn)
-	go relay(agentConn, clientConn)
+	w.Write([]byte(sessionID))
 }
 
-func relay(src, dst *websocket.Conn) {
+func sessionHandler(w http.ResponseWriter, r *http.Request) {
+	sessionID := r.URL.Query().Get("id")
+	val, ok := sessions.Load(sessionID)
+	if !ok {
+		http.Error(w, "invalid session", 404)
+		return
+	}
+
+	ws, _ := upgrader.Upgrade(w, r, nil)
+	ch := val.(chan *websocket.Conn)
+	ch <- ws
+
+	if len(ch) == 2 {
+		a := <-ch
+		b := <-ch
+
+		s := &Session{ID: sessionID}
+
+		go bridge(a, b, s)
+		go bridge(b, a, s)
+	}
+}
+
+func bridge(src, dst *websocket.Conn, s *Session) {
+	defer func() {
+		s.Once.Do(func() {
+			log.Printf("[server] sessão encerrada | session=%s", s.ID)
+		})
+
+		dst.WriteMessage(
+			websocket.CloseMessage,
+			websocket.FormatCloseMessage(
+				websocket.CloseNormalClosure,
+				"session closed",
+			),
+		)
+
+		dst.Close()
+		src.Close()
+	}()
+
 	for {
 		mt, data, err := src.ReadMessage()
 		if err != nil {
-			src.Close()
-			dst.Close()
 			return
 		}
-		if err := dst.WriteMessage(mt, data); err != nil {
-			src.Close()
-			dst.Close()
-			return
-		}
+		dst.WriteMessage(mt, data)
 	}
 }
 
 func main() {
 	http.HandleFunc("/agent", agentHandler)
 	http.HandleFunc("/client", clientHandler)
+	http.HandleFunc("/session", sessionHandler)
 
 	log.Println("Server em :8080")
-	log.Fatal(http.ListenAndServe(":8080", nil))
+	http.ListenAndServe(":8080", nil)
 }

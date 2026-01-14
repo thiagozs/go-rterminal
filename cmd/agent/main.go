@@ -1,152 +1,119 @@
 package main
 
 import (
-	"encoding/json"
-	"errors"
 	"log"
 	"os/exec"
-	"sync"
+	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
-	"github.com/thiagozs/go-shellhub/internal/protocol"
+)
+
+type Message struct {
+	Type      string `json:"type"`
+	SessionID string `json:"session_id,omitempty"`
+}
+
+const (
+	serverURL = "ws://127.0.0.1:8080"
+	agentID   = "agent-01"
 )
 
 func main() {
 	for {
-		err := runAgent()
-		if err != nil {
-			// EOF / close normal → ignora
-			if websocket.IsCloseError(err,
-				websocket.CloseNormalClosure,
-				websocket.CloseGoingAway,
-				websocket.CloseAbnormalClosure,
-			) || errors.Is(err, websocket.ErrCloseSent) {
-				log.Println("Sessão encerrada, mantendo agent online")
-				continue
-			}
-
-			log.Println("Agent error:", err)
+		log.Println("[agent] tentando conectar ao server...")
+		if err := run(); err != nil {
+			log.Println("[agent] conexão perdida:", err)
 		}
 
-		log.Println("Reiniciando conexão do agent...")
+		log.Println("[agent] tentando reconectar em 5s...")
+		time.Sleep(5 * time.Second)
 	}
-
 }
 
-func runAgent() error {
-	conn, _, err := websocket.DefaultDialer.Dial(
-		"ws://127.0.0.1:8080/agent", nil,
-	)
+func run() error {
+	ctrl, _, err := websocket.DefaultDialer.Dial(serverURL+"/agent", nil)
 	if err != nil {
 		return err
 	}
-	defer conn.Close()
+	defer ctrl.Close()
 
-	// Registro do agent
-	if err := conn.WriteJSON(protocol.Message{
-		Type:    "register",
-		AgentID: "agent-01",
-		Token:   "secret",
+	// registra o agent
+	if err := ctrl.WriteJSON(Message{
+		SessionID: agentID,
 	}); err != nil {
 		return err
 	}
 
-	log.Println("Agent online e aguardando sessão...")
+	log.Println("[agent] conectado ao server")
 
 	for {
-		// Espera qualquer dado do server
-		// iniciar sessão
-		var msg protocol.Message
-		if err := conn.ReadJSON(&msg); err != nil {
-			return err
+		var msg Message
+		if err := ctrl.ReadJSON(&msg); err != nil {
+			return err // 🔑 força reconexão
 		}
 
-		if msg.Type != "start-session" {
-			continue
-		}
-
-		log.Println("Iniciando nova sessão shell")
-		if err := runShellSession(conn); err != nil {
-			log.Println("Sessão encerrada:", err)
+		if msg.Type == "start-session" {
+			log.Println("[agent] iniciando sessão:", msg.SessionID)
+			go startShell(msg.SessionID)
 		}
 	}
 }
 
-func runShellSession(conn *websocket.Conn) error {
+func startShell(sessionID string) {
+	log.Println("[agent] sessão criada:", sessionID)
+
+	ws, _, err := websocket.DefaultDialer.Dial(
+		serverURL+"/session?id="+sessionID,
+		nil,
+	)
+	if err != nil {
+		log.Println("[agent] erro ao conectar sessão:", err)
+		return
+	}
+
 	cmd := exec.Command("/bin/bash")
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
-		return err
+		log.Println("[agent] erro ao iniciar PTY:", err)
+		ws.Close()
+		return
 	}
-	defer ptmx.Close()
 
-	done := make(chan struct{})
-	var once sync.Once
-	closeDone := func() { once.Do(func() { close(done) }) }
-
-	// PTY -> WS
+	// PTY → WS
 	go func() {
-		buf := make([]byte, 1024)
+		buf := make([]byte, 4096)
 		for {
 			n, err := ptmx.Read(buf)
 			if err != nil {
-				closeDone()
 				return
 			}
-			if err := conn.WriteMessage(websocket.BinaryMessage, buf[:n]); err != nil {
-				closeDone()
-				return
-			}
+			ws.WriteMessage(websocket.BinaryMessage, buf[:n])
 		}
 	}()
 
-	// WS -> PTY (dados + controle)
+	// WS → PTY
 	go func() {
 		for {
-			mt, data, err := conn.ReadMessage()
+			_, data, err := ws.ReadMessage()
 			if err != nil {
-				closeDone()
 				return
 			}
-
-			// controle
-			if mt == websocket.TextMessage {
-				var msg protocol.Message
-				if err := json.Unmarshal(data, &msg); err != nil {
-					continue
-				}
-
-				if msg.Type == "resize" {
-					pty.Setsize(ptmx, &pty.Winsize{
-						Cols: msg.Cols,
-						Rows: msg.Rows,
-					})
-				}
-				continue
-			}
-
-			// dados
-			if _, err := ptmx.Write(data); err != nil {
-				closeDone()
-				return
-			}
+			ptmx.Write(data)
 		}
 	}()
 
-	// Aguarda bash encerrar
-	go func() {
-		cmd.Wait()
-		closeDone()
-	}()
+	// aguarda shell encerrar
+	err = cmd.Wait()
+	log.Printf("[agent] shell encerrado | session=%s | err=%v", sessionID, err)
 
-	<-done
-
-	_ = conn.WriteJSON(protocol.Message{
-		Type: "end-session",
-	})
-
-	// sessão terminou, mas agent continua
-	log.Println("Shell encerrado")
-	return nil
+	// 🔑 fecha websocket da sessão (desbloqueia client)
+	ws.WriteMessage(
+		websocket.CloseMessage,
+		websocket.FormatCloseMessage(
+			websocket.CloseNormalClosure,
+			"shell exited",
+		),
+	)
+	ws.Close()
 }
