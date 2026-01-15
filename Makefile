@@ -1,7 +1,16 @@
-.PHONY: help build build-server build-agent build-client run-server run-agent run-client
+.PHONY: help build build-server build-agent build-client run-server run-agent run-client healthcheck
 
 GO ?= go
 BIN_DIR ?= bin
+AUTH_TOKEN ?= change-me
+TLS_CERT ?=
+TLS_KEY ?=
+TLS_CA ?=
+TLS_INSECURE ?= false
+SESSION_TIMEOUT ?= 15s
+BACKOFF_MIN ?= 5s
+BACKOFF_MAX ?= 60s
+KEEPALIVE_INTERVAL ?= 15s
 
 SERVER_BIN := $(BIN_DIR)/server
 AGENT_BIN := $(BIN_DIR)/agent
@@ -16,6 +25,18 @@ help:
 	@echo "  run-server    Run server (go run)"
 	@echo "  run-agent     Run agent (go run)"
 	@echo "  run-client    Run client (go run)"
+	@echo "  healthcheck   Check server health endpoint"
+	@echo ""
+	@echo "Vars:"
+	@echo "  AUTH_TOKEN   Auth token (default: change-me)"
+	@echo "  TLS_CERT     Server TLS cert path"
+	@echo "  TLS_KEY      Server TLS key path"
+	@echo "  TLS_CA       Client/agent CA path"
+	@echo "  TLS_INSECURE Client/agent skip TLS verify (true/false)"
+	@echo "  SESSION_TIMEOUT Server session pairing timeout (default: 15s, 0 disables)"
+	@echo "  BACKOFF_MIN  Agent backoff min (default: 5s)"
+	@echo "  BACKOFF_MAX  Agent backoff max (default: 60s)"
+	@echo "  KEEPALIVE_INTERVAL Agent keepalive interval (default: 15s, 0 disables)"
 
 build: build-server build-agent build-client
 
@@ -32,10 +53,24 @@ build-client:
 	$(GO) build -o $(CLIENT_BIN) ./cmd/client
 
 run-server:
-	$(GO) run ./cmd/server --addr :8080
+	$(GO) run ./cmd/server --addr :8080 --auth-token $(AUTH_TOKEN) \
+		--session-timeout $(SESSION_TIMEOUT) \
+		$(if $(TLS_CERT),--tls-cert $(TLS_CERT),) \
+		$(if $(TLS_KEY),--tls-key $(TLS_KEY),)
 
 run-agent:
-	$(GO) run ./cmd/agent --server-url ws://127.0.0.1:8080 --agent-id agent-01 --shell /bin/bash
+	$(GO) run ./cmd/agent --server-url ws://127.0.0.1:8080 --agent-id agent-01 \
+		--shell /bin/bash --auth-token $(AUTH_TOKEN) \
+		--backoff-min $(BACKOFF_MIN) --backoff-max $(BACKOFF_MAX) \
+		--keepalive-interval $(KEEPALIVE_INTERVAL) \
+		$(if $(TLS_CA),--tls-ca $(TLS_CA),) \
+		$(if $(filter true,$(TLS_INSECURE)),--tls-insecure,)
 
 run-client:
-	$(GO) run ./cmd/client --server-url http://127.0.0.1:8080 --agent-id agent-01
+	$(GO) run ./cmd/client --server-url http://127.0.0.1:8080 --agent-id agent-01 \
+		--auth-token $(AUTH_TOKEN) \
+		$(if $(TLS_CA),--tls-ca $(TLS_CA),) \
+		$(if $(filter true,$(TLS_INSECURE)),--tls-insecure,)
+
+healthcheck:
+	@curl -fsS http://127.0.0.1:8080/healthz
