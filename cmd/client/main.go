@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -8,16 +9,35 @@ import (
 	"strings"
 
 	"github.com/gorilla/websocket"
+	"github.com/spf13/cobra"
 	"golang.org/x/term"
 )
 
 func main() {
+	rootCmd := &cobra.Command{
+		Use:   "client",
+		Short: "Conecta um cliente a uma sessao remota",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runClient(cmd)
+		},
+	}
+
+	rootCmd.Flags().String("server-url", "http://127.0.0.1:8080", "URL HTTP do server")
+	rootCmd.Flags().String("agent-id", "agent-01", "ID do agent alvo")
+
+	cobra.CheckErr(rootCmd.Execute())
+}
+
+func runClient(cmd *cobra.Command) error {
+	serverURL, _ := cmd.Flags().GetString("server-url")
+	agentID, _ := cmd.Flags().GetString("agent-id")
+
 	log.Println("[client] solicitando nova sessão")
 
 	// 1) solicita nova sessão ao server
-	resp, err := http.Get("http://127.0.0.1:8080/client?agent=agent-01")
+	resp, err := http.Get(serverURL + "/client?agent=" + agentID)
 	if err != nil {
-		log.Fatal("[client] erro ao criar sessão:", err)
+		return fmt.Errorf("[client] erro ao criar sessão: %w", err)
 	}
 	defer resp.Body.Close()
 
@@ -28,11 +48,11 @@ func main() {
 
 	// 2) conecta no websocket da sessão
 	ws, _, err := websocket.DefaultDialer.Dial(
-		"ws://127.0.0.1:8080/session?id="+sessionID,
+		wsBaseURL(serverURL)+"/session?id="+sessionID,
 		nil,
 	)
 	if err != nil {
-		log.Fatal("[client] erro ao conectar sessão:", err)
+		return fmt.Errorf("[client] erro ao conectar sessão: %w", err)
 	}
 	defer ws.Close()
 
@@ -42,7 +62,7 @@ func main() {
 	fd := int(os.Stdin.Fd())
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		log.Fatal("[client] erro ao ativar raw mode:", err)
+		return fmt.Errorf("[client] erro ao ativar raw mode: %w", err)
 	}
 	defer term.Restore(fd, oldState)
 
@@ -97,4 +117,12 @@ func main() {
 	// 7) restaura terminal e imprime mensagem final
 	term.Restore(fd, oldState)
 	os.Stdout.WriteString("\r\n[client] sessão encerrada.\r\n")
+	return nil
+}
+
+func wsBaseURL(httpBase string) string {
+	if after, ok := strings.CutPrefix(httpBase, "https://"); ok {
+		return "wss://" + after
+	}
+	return "ws://" + strings.TrimPrefix(httpBase, "http://")
 }

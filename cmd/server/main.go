@@ -1,12 +1,14 @@
 package main
 
 import (
+	"fmt"
 	"log"
 	"net/http"
 	"sync"
 
 	"github.com/google/uuid"
 	"github.com/gorilla/websocket"
+	"github.com/spf13/cobra"
 )
 
 type Message struct {
@@ -112,10 +114,29 @@ func bridge(src, dst *websocket.Conn, s *Session) {
 }
 
 func main() {
+	rootCmd := &cobra.Command{
+		Use:   "server",
+		Short: "Inicia o servidor do ShellHub",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runServer(cmd)
+		},
+	}
+
+	rootCmd.Flags().String("addr", ":8080", "Endereco de escuta HTTP")
+
+	cobra.CheckErr(rootCmd.Execute())
+}
+
+func runServer(cmd *cobra.Command) error {
+	addr, _ := cmd.Flags().GetString("addr")
+
 	http.HandleFunc("/agent", agentHandler)
 	http.HandleFunc("/client", clientHandler)
 	http.HandleFunc("/session", sessionHandler)
 
-	log.Println("Server em :8080")
-	http.ListenAndServe(":8080", nil)
+	log.Println("Server em", addr)
+	if err := http.ListenAndServe(addr, nil); err != nil {
+		return fmt.Errorf("erro ao iniciar server: %w", err)
+	}
+	return nil
 }

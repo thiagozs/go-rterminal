@@ -7,6 +7,7 @@ import (
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
+	"github.com/spf13/cobra"
 )
 
 type Message struct {
@@ -14,15 +15,30 @@ type Message struct {
 	SessionID string `json:"session_id,omitempty"`
 }
 
-const (
-	serverURL = "ws://127.0.0.1:8080"
-	agentID   = "agent-01"
-)
-
 func main() {
+	rootCmd := &cobra.Command{
+		Use:   "agent",
+		Short: "Conecta um agente ao servidor do ShellHub",
+		RunE: func(cmd *cobra.Command, args []string) error {
+			return runAgent(cmd)
+		},
+	}
+
+	rootCmd.Flags().String("server-url", "ws://127.0.0.1:8080", "URL WS do server")
+	rootCmd.Flags().String("agent-id", "agent-01", "ID do agent")
+	rootCmd.Flags().String("shell", "/bin/bash", "Shell para abrir no agente")
+
+	cobra.CheckErr(rootCmd.Execute())
+}
+
+func runAgent(cmd *cobra.Command) error {
+	serverURL, _ := cmd.Flags().GetString("server-url")
+	agentID, _ := cmd.Flags().GetString("agent-id")
+	shellPath, _ := cmd.Flags().GetString("shell")
+
 	for {
 		log.Println("[agent] tentando conectar ao server...")
-		if err := run(); err != nil {
+		if err := run(serverURL, agentID, shellPath); err != nil {
 			log.Println("[agent] conexão perdida:", err)
 		}
 
@@ -31,7 +47,7 @@ func main() {
 	}
 }
 
-func run() error {
+func run(serverURL, agentID, shellPath string) error {
 	ctrl, _, err := websocket.DefaultDialer.Dial(serverURL+"/agent", nil)
 	if err != nil {
 		return err
@@ -55,12 +71,12 @@ func run() error {
 
 		if msg.Type == "start-session" {
 			log.Println("[agent] iniciando sessão:", msg.SessionID)
-			go startShell(msg.SessionID)
+			go startShell(serverURL, shellPath, msg.SessionID)
 		}
 	}
 }
 
-func startShell(sessionID string) {
+func startShell(serverURL, shellPath, sessionID string) {
 	log.Println("[agent] sessão criada:", sessionID)
 
 	ws, _, err := websocket.DefaultDialer.Dial(
@@ -72,7 +88,7 @@ func startShell(sessionID string) {
 		return
 	}
 
-	cmd := exec.Command("/bin/bash")
+	cmd := exec.Command(shellPath)
 	ptmx, err := pty.Start(cmd)
 	if err != nil {
 		log.Println("[agent] erro ao iniciar PTY:", err)
