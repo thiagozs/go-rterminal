@@ -1,4 +1,4 @@
-module github.com/thiagozs/go-shellhub
+module github.com/thiagozs/go-rterminal
 
 go 1.25.1
 

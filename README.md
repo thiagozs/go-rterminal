@@ -1,6 +1,6 @@
-# go-shellhub
+# go-rterminal
 
-go-shellhub e um projeto simples para criar sessoes de shell remotas via WebSocket. Ele e dividido em tres componentes:
+go-rterminal e um projeto simples para criar sessoes de shell remotas via WebSocket. Ele e dividido em tres componentes:
 
 - server: coordena agentes e clientes e cria sessoes
 - agent: conecta ao server e abre um shell local em PTY
@@ -12,6 +12,10 @@ O fluxo e: o client pede uma nova sessao ao server, o server aciona o agent, e a
 
 - Go 1.25+ (conforme `go.mod`)
 - Acesso local a `127.0.0.1:8080` (ajuste via flags se necessario)
+- Sistemas suportados:
+  - `server`: Linux, macOS, Windows
+  - `client`: Linux, macOS, Windows
+  - `agent`: Linux, macOS (usa PTY; nao funciona no Windows)
 
 ## Como executar
 
