@@ -1,5 +1,11 @@
 package protocol
 
+const (
+	TypeRegisterAgent = "register-agent"
+	TypeStartSession  = "start-session"
+	TypeResize        = "resize"
+)
+
 type Message struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`

@@ -1,17 +1,20 @@
 package main
 
 import (
-	"crypto/tls"
-	"crypto/x509"
 	"fmt"
 	"io"
 	"log"
 	"net/http"
+	"net/url"
 	"os"
 	"strings"
+	"time"
 
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
+	"github.com/thiagozs/go-rterminal/internal/endpoint"
+	"github.com/thiagozs/go-rterminal/internal/protocol"
+	"github.com/thiagozs/go-rterminal/internal/tlsutil"
 	"golang.org/x/term"
 )
 
@@ -21,163 +24,141 @@ func main() {
 		Short:         "Conecta um cliente a uma sessao remota",
 		SilenceUsage:  true,
 		SilenceErrors: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			return runClient(cmd)
-		},
+		RunE:          runClient,
 	}
-
 	rootCmd.Flags().String("server-url", "http://127.0.0.1:8080", "URL HTTP do server")
 	rootCmd.Flags().String("agent-id", "agent-01", "ID do agent alvo")
 	rootCmd.Flags().String("auth-token", "change-me", "Token de autenticacao")
 	rootCmd.Flags().String("tls-ca", "", "Caminho do CA para TLS (opcional)")
 	rootCmd.Flags().Bool("tls-insecure", false, "Ignora verificacao TLS (nao recomendado)")
-
 	cobra.CheckErr(rootCmd.Execute())
 }
 
-func runClient(cmd *cobra.Command) error {
+func runClient(cmd *cobra.Command, _ []string) error {
 	serverURL, _ := cmd.Flags().GetString("server-url")
 	agentID, _ := cmd.Flags().GetString("agent-id")
 	authToken, _ := cmd.Flags().GetString("auth-token")
 	tlsCA, _ := cmd.Flags().GetString("tls-ca")
 	tlsInsecure, _ := cmd.Flags().GetBool("tls-insecure")
+	if agentID == "" {
+		return fmt.Errorf("agent-id não pode ser vazio")
+	}
 
-	tlsConfig, err := tlsConfigFromFlags(tlsCA, tlsInsecure)
+	tlsConfig, err := tlsutil.ClientConfig(tlsCA, tlsInsecure)
 	if err != nil {
 		return err
 	}
-
 	httpClient := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: tlsConfig},
+		Timeout:   15 * time.Second,
 	}
 
-	log.Println("[client] solicitando nova sessão")
-
-	// 1) solicita nova sessão ao server
-	req, err := http.NewRequest("GET", serverURL+"/client?agent="+agentID, nil)
+	clientURL, err := endpoint.URL(serverURL, "/client", url.Values{"agent": {agentID}}, false)
 	if err != nil {
-		return fmt.Errorf("[client] erro ao criar requisição: %w", err)
+		return err
 	}
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
+	req, err := http.NewRequest(http.MethodPost, clientURL, nil)
+	if err != nil {
+		return fmt.Errorf("criar requisição de sessão: %w", err)
 	}
+	setAuthorization(req.Header, authToken)
+
+	log.Printf("[client] solicitando sessão | agent=%s", agentID)
 	resp, err := httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("[client] erro ao criar sessão: %w", err)
+		return fmt.Errorf("criar sessão: %w", err)
 	}
 	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		body, _ := io.ReadAll(resp.Body)
-		return fmt.Errorf("[client] erro ao criar sessão: %s", strings.TrimSpace(string(body)))
-	}
-
-	sessionIDBytes, _ := io.ReadAll(resp.Body)
-	sessionID := strings.TrimSpace(string(sessionIDBytes))
-
-	log.Println("[client] sessão criada:", sessionID)
-
-	// 2) conecta no websocket da sessão
-	headers := http.Header{}
-	if authToken != "" {
-		headers.Set("Authorization", "Bearer "+authToken)
-	}
-	dialer := websocket.Dialer{TLSClientConfig: tlsConfig}
-	ws, _, err := dialer.Dial(
-		wsBaseURL(serverURL)+"/session?id="+sessionID,
-		headers,
-	)
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
 	if err != nil {
-		return fmt.Errorf("[client] erro ao conectar sessão: %w", err)
+		return fmt.Errorf("ler resposta da sessão: %w", err)
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("criar sessão: %s", strings.TrimSpace(string(body)))
+	}
+	sessionID := strings.TrimSpace(string(body))
+	if sessionID == "" {
+		return fmt.Errorf("servidor retornou uma sessão vazia")
+	}
+
+	sessionURL, err := endpoint.URL(serverURL, "/session", url.Values{"id": {sessionID}}, true)
+	if err != nil {
+		return err
+	}
+	headers := http.Header{}
+	setAuthorization(headers, authToken)
+	ws, _, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).Dial(sessionURL, headers)
+	if err != nil {
+		return fmt.Errorf("conectar à sessão: %w", err)
 	}
 	defer ws.Close()
+	ws.SetReadLimit(1 << 20)
 
-	log.Println("[client] conectado à sessão")
-
-	// 3) coloca terminal em raw mode
 	fd := int(os.Stdin.Fd())
+	if !term.IsTerminal(fd) {
+		return fmt.Errorf("stdin precisa ser um terminal")
+	}
 	oldState, err := term.MakeRaw(fd)
 	if err != nil {
-		return fmt.Errorf("[client] erro ao ativar raw mode: %w", err)
+		return fmt.Errorf("ativar raw mode: %w", err)
 	}
-	defer term.Restore(fd, oldState)
+	defer func() { _ = term.Restore(fd, oldState) }()
 
-	done := make(chan struct{})
+	if cols, rows, sizeErr := term.GetSize(fd); sizeErr == nil {
+		_ = ws.WriteJSON(protocol.Message{Type: protocol.TypeResize, Rows: uint16(rows), Cols: uint16(cols)})
+	}
 
-	// 4) stdin --> websocket
-	go func() {
-		buf := make([]byte, 1024)
-		for {
-			n, err := os.Stdin.Read(buf)
-			if err != nil {
-				log.Println("[client] stdin fechado")
-				close(done)
-				return
-			}
+	inputDone := make(chan error, 1)
+	go copyInput(ws, inputDone)
 
-			err = ws.WriteMessage(websocket.BinaryMessage, buf[:n])
-			if err != nil {
-				log.Println("[client] erro ao enviar stdin:", err)
-				close(done)
-				return
-			}
+	log.Printf("[client] conectado | session=%s", sessionID)
+	err = copyOutput(ws)
+	select {
+	case inputErr := <-inputDone:
+		if err == nil {
+			err = inputErr
 		}
-	}()
-
-	// 5) websocket --> stdout
-	go func() {
-		for {
-			mt, data, err := ws.ReadMessage()
-			if err != nil {
-				log.Println("[client] sessão encerrada pelo server")
-				close(done)
-				return
-			}
-
-			switch mt {
-
-			case websocket.BinaryMessage:
-				_, _ = os.Stdout.Write(data)
-
-			case websocket.CloseMessage:
-				log.Println("[client] shell finalizado")
-				close(done)
-				return
-			}
-		}
-	}()
-
-	// 6)aguarda encerramento
-	<-done
-
-	// 7) restaura terminal e imprime mensagem final
-	term.Restore(fd, oldState)
-	os.Stdout.WriteString("\r\n[client] sessão encerrada.\r\n")
-	return nil
+	default:
+	}
+	_, _ = os.Stdout.WriteString("\r\n[client] sessão encerrada.\r\n")
+	return err
 }
 
-func wsBaseURL(httpBase string) string {
-	if after, ok := strings.CutPrefix(httpBase, "https://"); ok {
-		return "wss://" + after
+func copyInput(ws *websocket.Conn, done chan<- error) {
+	buffer := make([]byte, 4096)
+	for {
+		n, err := os.Stdin.Read(buffer)
+		if err != nil {
+			done <- err
+			_ = ws.Close()
+			return
+		}
+		if err := ws.WriteMessage(websocket.BinaryMessage, buffer[:n]); err != nil {
+			done <- err
+			return
+		}
 	}
-	return "ws://" + strings.TrimPrefix(httpBase, "http://")
 }
 
-func tlsConfigFromFlags(caPath string, insecure bool) (*tls.Config, error) {
-	if caPath == "" {
-		return &tls.Config{InsecureSkipVerify: insecure}, nil
+func copyOutput(ws *websocket.Conn) error {
+	for {
+		messageType, data, err := ws.ReadMessage()
+		if err != nil {
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway) {
+				return nil
+			}
+			return fmt.Errorf("ler sessão: %w", err)
+		}
+		if messageType == websocket.BinaryMessage {
+			if _, err := os.Stdout.Write(data); err != nil {
+				return fmt.Errorf("escrever saída: %w", err)
+			}
+		}
 	}
+}
 
-	caCert, err := os.ReadFile(caPath)
-	if err != nil {
-		return nil, err
+func setAuthorization(header http.Header, token string) {
+	if token != "" {
+		header.Set("Authorization", "Bearer "+token)
 	}
-	pool := x509.NewCertPool()
-	if !pool.AppendCertsFromPEM(caCert) {
-		return nil, fmt.Errorf("falha ao carregar CA")
-	}
-
-	return &tls.Config{
-		InsecureSkipVerify: insecure,
-		RootCAs:            pool,
-	}, nil
 }

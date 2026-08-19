@@ -6,9 +6,9 @@ services:
     command: >
       sh -c '
         args="--addr :8080 --auth-token ${AUTH_TOKEN:-change-me} --session-timeout ${SESSION_TIMEOUT:-15s}";
-        if [ -n "${TLS_CERT:-}" ]; then args="$args --tls-cert ${TLS_CERT}"; fi;
-        if [ -n "${TLS_KEY:-}" ]; then args="$args --tls-key ${TLS_KEY}"; fi;
-        exec /usr/local/bin/server $args
+        if [ -n "${TLS_CERT:-}" ]; then args="$$args --tls-cert ${TLS_CERT:-}"; fi;
+        if [ -n "${TLS_KEY:-}" ]; then args="$$args --tls-key ${TLS_KEY:-}"; fi;
+        exec /usr/local/bin/server $$args
       '
     ports:
       - "8080:8080"
@@ -22,11 +22,11 @@ services:
     command: >
       sh -c '
         args="--server-url ws://server:8080 --agent-id agent-01 --shell /bin/bash --auth-token ${AUTH_TOKEN:-change-me} --keepalive-interval ${KEEPALIVE_INTERVAL:-15s}";
-        if [ -n "${BACKOFF_MIN:-}" ]; then args="$args --backoff-min ${BACKOFF_MIN}"; fi;
-        if [ -n "${BACKOFF_MAX:-}" ]; then args="$args --backoff-max ${BACKOFF_MAX}"; fi;
-        if [ -n "${TLS_CA:-}" ]; then args="$args --tls-ca ${TLS_CA}"; fi;
-        if [ -n "${TLS_INSECURE:-}" ]; then args="$args --tls-insecure"; fi;
-        exec /usr/local/bin/agent $args
+        if [ -n "${BACKOFF_MIN:-}" ]; then args="$$args --backoff-min ${BACKOFF_MIN:-}"; fi;
+        if [ -n "${BACKOFF_MAX:-}" ]; then args="$$args --backoff-max ${BACKOFF_MAX:-}"; fi;
+        if [ -n "${TLS_CA:-}" ]; then args="$$args --tls-ca ${TLS_CA:-}"; fi;
+        if [ "${TLS_INSECURE:-false}" = "true" ]; then args="$$args --tls-insecure"; fi;
+        exec /usr/local/bin/agent $$args
       '
 
   client:
@@ -41,9 +41,9 @@ services:
     command: >
       sh -c '
         args="--server-url http://server:8080 --agent-id agent-01 --auth-token ${AUTH_TOKEN:-change-me}";
-        if [ -n "${TLS_CA:-}" ]; then args="$args --tls-ca ${TLS_CA}"; fi;
-        if [ -n "${TLS_INSECURE:-}" ]; then args="$args --tls-insecure"; fi;
-        exec /usr/local/bin/client $args
+        if [ -n "${TLS_CA:-}" ]; then args="$$args --tls-ca ${TLS_CA:-}"; fi;
+        if [ "${TLS_INSECURE:-false}" = "true" ]; then args="$$args --tls-insecure"; fi;
+        exec /usr/local/bin/client $$args
       '
     stdin_open: true
     tty: true
