@@ -1,2 +1,6 @@
 bin/*
 !bin/.gitkeep
+*.db
+*.db-wal
+*.db-shm
+.playwright-cli/

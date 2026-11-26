@@ -18,4 +18,10 @@ type Message struct {
 
 	AgentID string `json:"agent_id,omitempty"`
 	Token   string `json:"token,omitempty"`
+
+	// Facts an agent reports when it registers.
+	Hostname string `json:"hostname,omitempty"`
+	OS       string `json:"os,omitempty"`
+	Arch     string `json:"arch,omitempty"`
+	Version  string `json:"version,omitempty"`
 }

@@ -1,0 +1,68 @@
+# go-rterminal: server + painel de administracao, para uma stack do Portainer,
+# atras do nginx-proxy que voce ja tem (HTTPS via Let's Encrypt no proxy).
+#
+# Portainer > Stacks > Add stack > Repository
+#   Repository URL ........ URL do repositorio git do projeto
+#   Compose path .......... deploy/server/docker-compose.yml
+#   Environment variables . as de .env.example (DOMAIN e LETSENCRYPT_EMAIL sao obrigatorias)
+# O build usa o Dockerfile da raiz do repositorio (alvo "server").
+#
+# O server nao publica porta no host: so o nginx-proxy o alcanca pela rede
+# Docker compartilhada (PROXY_NETWORK).
+#
+# Primeiro acesso: a senha temporaria do admin aparece em Stacks > rterminal >
+# server > Logs (procure por "PRIMEIRO ACESSO") e deve ser trocada no login.
+
+services:
+  server:
+    build:
+      context: ../..
+      dockerfile: Dockerfile
+      target: server
+    image: go-rterminal-server:local
+    container_name: rterminal-server
+    restart: unless-stopped
+    command:
+      - "/usr/local/bin/server"
+      - "--addr=:8080"
+      - "--db=/data/rterminal.db"
+      - "--public-url=https://${DOMAIN:?defina a variavel DOMAIN}"
+      # Faixa da rede Docker do proxy: so ela pode informar o IP real (X-Forwarded-For).
+      - "--trusted-proxies=${TRUSTED_PROXIES:-172.16.0.0/12}"
+    environment:
+      # Lidas pelo nginx-proxy e pelo acme-companion.
+      VIRTUAL_HOST: "${DOMAIN}"
+      VIRTUAL_PORT: "8080"
+      LETSENCRYPT_HOST: "${DOMAIN}"
+      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:?defina a variavel LETSENCRYPT_EMAIL}"
+      # Opcional. Vazia = senha temporaria gerada no primeiro start e mostrada
+      # nos logs (troca obrigatoria no primeiro login).
+      RTERMINAL_ADMIN_PASSWORD: "${RTERMINAL_ADMIN_PASSWORD:-}"
+    expose:
+      - "8080"
+    volumes:
+      - rterminal-data:/data
+    networks:
+      - proxy
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    read_only: true
+    tmpfs:
+      - /tmp
+    cap_drop:
+      - ALL
+    security_opt:
+      - "no-new-privileges:true"
+
+volumes:
+  rterminal-data:
+
+networks:
+  proxy:
+    # Rede em que o seu nginx-proxy ja esta (Portainer > Networks).
+    name: "${PROXY_NETWORK:-nginx-proxy}"
+    external: true

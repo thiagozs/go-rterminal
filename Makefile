@@ -1,8 +1,10 @@
-.PHONY: require-token help build build-server build-agent build-client run-server run-agent run-client healthcheck
+.PHONY: require-token run-server-admin help build build-server build-agent build-client run-server run-agent run-client healthcheck
 
 GO ?= go
 BIN_DIR ?= bin
 AUTH_TOKEN ?=
+DB ?= rterminal.db
+PUBLIC_URL ?=
 TLS_CERT ?=
 TLS_KEY ?=
 TLS_CA ?=
@@ -23,6 +25,7 @@ help:
 	@echo "  build-agent   Build agent binary"
 	@echo "  build-client  Build client binary"
 	@echo "  run-server    Run server (go run)"
+	@echo "  run-server-admin  Run server with the admin panel (SQLite, no AUTH_TOKEN needed)"
 	@echo "  run-agent     Run agent (go run)"
 	@echo "  run-client    Run client (go run)"
 	@echo "  healthcheck   Check server health endpoint"
@@ -55,6 +58,12 @@ build-client:
 run-server: require-token
 	$(GO) run ./cmd/server --addr :8080 --auth-token "$(AUTH_TOKEN)" \
 		--session-timeout $(SESSION_TIMEOUT) \
+		$(if $(TLS_CERT),--tls-cert $(TLS_CERT),) \
+		$(if $(TLS_KEY),--tls-key $(TLS_KEY),)
+
+run-server-admin:
+	$(GO) run ./cmd/server --addr :8080 --db $(DB) --session-timeout $(SESSION_TIMEOUT) \
+		$(if $(PUBLIC_URL),--public-url $(PUBLIC_URL),) \
 		$(if $(TLS_CERT),--tls-cert $(TLS_CERT),) \
 		$(if $(TLS_KEY),--tls-key $(TLS_KEY),)
 

@@ -24,8 +24,16 @@ const (
 )
 
 type Config struct {
-	AuthToken      string
-	SessionTimeout time.Duration
+	// AuthToken is a shared secret. Without AgentAuth it authenticates every
+	// endpoint (legacy mode); with AgentAuth it only authenticates CLI clients.
+	AuthToken string
+	// AgentAuth, when set, switches agents to per-machine credentials: it
+	// resolves a bearer token to the machine id it belongs to.
+	AgentAuth func(token string) (agentID string, ok bool)
+	// OnAgentConnected / OnAgentDisconnected observe agent registrations.
+	OnAgentConnected    func(id string, info protocol.Message)
+	OnAgentDisconnected func(id string)
+	SessionTimeout      time.Duration
 	// KeepAliveInterval controls liveness pings; zero uses
 	// DefaultKeepAliveInterval and a negative value disables them.
 	KeepAliveInterval time.Duration
@@ -34,6 +42,9 @@ type Config struct {
 
 type Server struct {
 	authToken      string
+	agentAuth      func(token string) (string, bool)
+	onConnected    func(id string, info protocol.Message)
+	onDisconnected func(id string)
 	sessionTimeout time.Duration
 	keepAlive      time.Duration
 	logger         *log.Logger
@@ -65,9 +76,10 @@ func (a *agentConn) alive() bool {
 }
 
 type session struct {
-	id    string
-	conns []*websocket.Conn
-	timer *time.Timer
+	id      string
+	agentID string // machine the session was opened for; "" = any (legacy)
+	conns   []*websocket.Conn
+	timer   *time.Timer
 }
 
 func New(config Config) *Server {
@@ -82,6 +94,9 @@ func New(config Config) *Server {
 	return &Server{
 		keepAlive:      keepAlive,
 		authToken:      config.AuthToken,
+		agentAuth:      config.AgentAuth,
+		onConnected:    config.OnAgentConnected,
+		onDisconnected: config.OnAgentDisconnected,
 		sessionTimeout: config.SessionTimeout,
 		logger:         logger,
 		agents:         make(map[string]*agentConn),
@@ -98,20 +113,31 @@ func (s *Server) Handler() http.Handler {
 	return mux
 }
 
-func (s *Server) authorized(r *http.Request) bool {
-	if s.authToken == "" {
-		return true
-	}
+func bearerToken(r *http.Request) string {
 	const prefix = "Bearer "
 	header := r.Header.Get("Authorization")
 	if len(header) <= len(prefix) || header[:len(prefix)] != prefix {
-		return false
+		return ""
 	}
-	return subtle.ConstantTimeCompare([]byte(header[len(prefix):]), []byte(s.authToken)) == 1
+	return header[len(prefix):]
+}
+
+func (s *Server) sharedTokenMatches(token string) bool {
+	return s.authToken != "" && token != "" &&
+		subtle.ConstantTimeCompare([]byte(token), []byte(s.authToken)) == 1
+}
+
+// authorizedShared authenticates CLI clients (and, in legacy mode, agents)
+// with the shared token. Legacy mode with no token configured is open.
+func (s *Server) authorizedShared(r *http.Request) bool {
+	if s.agentAuth == nil && s.authToken == "" {
+		return true
+	}
+	return s.sharedTokenMatches(bearerToken(r))
 }
 
 func (s *Server) ensureAuth(w http.ResponseWriter, r *http.Request) bool {
-	if s.authorized(r) {
+	if s.authorizedShared(r) {
 		return true
 	}
 	http.Error(w, "unauthorized", http.StatusUnauthorized)
@@ -129,7 +155,16 @@ func (s *Server) healthHandler(w http.ResponseWriter, r *http.Request) {
 }
 
 func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.ensureAuth(w, r) {
+	// With per-machine credentials the token itself names the agent.
+	machineID := ""
+	if s.agentAuth != nil {
+		id, ok := s.agentAuth(bearerToken(r))
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		machineID = id
+	} else if !s.ensureAuth(w, r) {
 		return
 	}
 	ws, err := s.upgrader.Upgrade(w, r, nil)
@@ -144,6 +179,14 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 	if err := ws.ReadJSON(&msg); err != nil {
 		closeWebSocket(ws, websocket.ClosePolicyViolation, "invalid agent registration")
 		return
+	}
+	if machineID != "" {
+		if msg.AgentID != "" && msg.AgentID != machineID {
+			closeWebSocket(ws, websocket.ClosePolicyViolation, "agent id does not match credential")
+			return
+		}
+		msg.AgentID = machineID
+		msg.Type = protocol.TypeRegisterAgent
 	}
 	// SessionID was used as the agent ID by versions prior to the shared protocol.
 	if msg.AgentID == "" && msg.Type == "" {
@@ -166,9 +209,16 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 		closeWebSocket(replaced.conn, websocket.CloseNormalClosure, "agent replaced")
 		s.logger.Printf("[server] conexão inativa substituída | agent=%s", msg.AgentID)
 	}
-	defer s.removeAgent(msg.AgentID, agent)
+	defer func() {
+		if s.removeAgent(msg.AgentID, agent) && s.onDisconnected != nil {
+			s.onDisconnected(msg.AgentID)
+		}
+	}()
 
 	s.logger.Printf("[server] agente conectado | agent=%s", msg.AgentID)
+	if s.onConnected != nil {
+		s.onConnected(msg.AgentID, msg)
+	}
 	defer s.startKeepAlive(ws)()
 	for {
 		if _, _, err := ws.ReadMessage(); err != nil {
@@ -205,12 +255,59 @@ func (s *Server) registerAgent(id string, agent *agentConn) (replaced *agentConn
 	}
 }
 
-func (s *Server) removeAgent(id string, expected *agentConn) {
+// removeAgent unregisters expected and reports whether it was still current.
+func (s *Server) removeAgent(id string, expected *agentConn) bool {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.agents[id] == expected {
 		delete(s.agents, id)
+		return true
 	}
+	return false
+}
+
+// IsOnline reports whether an agent is registered under id.
+func (s *Server) IsOnline(id string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.agents[id] != nil
+}
+
+// Disconnect drops the agent registered under id, e.g. after its credential
+// was revoked or rotated.
+func (s *Server) Disconnect(id string, reason string) {
+	s.mu.Lock()
+	agent := s.agents[id]
+	s.mu.Unlock()
+	if agent != nil {
+		closeWebSocket(agent.conn, websocket.ClosePolicyViolation, reason)
+	}
+}
+
+// ErrAgentOffline is returned when no agent is registered for a machine.
+var ErrAgentOffline = errors.New("agent offline")
+
+// OpenTerminal asks the agent for machineID to start a session and attaches
+// conn (an already upgraded WebSocket, e.g. a browser terminal) as the first
+// end. The relay owns conn from here on; the agent joins as the second end.
+func (s *Server) OpenTerminal(machineID string, conn *websocket.Conn) (string, error) {
+	s.mu.Lock()
+	agent := s.agents[machineID]
+	s.mu.Unlock()
+	if agent == nil {
+		return "", ErrAgentOffline
+	}
+	conn.SetReadLimit(maxMessageSize)
+	state := s.createSession(machineID)
+	s.mu.Lock()
+	state.conns = append(state.conns, conn)
+	s.mu.Unlock()
+	if err := agent.writeJSON(protocol.Message{Type: protocol.TypeStartSession, SessionID: state.id}); err != nil {
+		s.removeAgent(machineID, agent)
+		s.deleteSession(state.id, state)
+		return "", ErrAgentOffline
+	}
+	return state.id, nil
 }
 
 func (s *Server) clientHandler(w http.ResponseWriter, r *http.Request) {
@@ -236,7 +333,7 @@ func (s *Server) clientHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	state := s.createSession()
+	state := s.createSession(agentID)
 	if err := agent.writeJSON(protocol.Message{Type: protocol.TypeStartSession, SessionID: state.id}); err != nil {
 		s.removeAgent(agentID, agent)
 		s.deleteSession(state.id, state)
@@ -248,8 +345,8 @@ func (s *Server) clientHandler(w http.ResponseWriter, r *http.Request) {
 	_, _ = w.Write([]byte(state.id))
 }
 
-func (s *Server) createSession() *session {
-	state := &session{id: uuid.NewString()}
+func (s *Server) createSession(agentID string) *session {
+	state := &session{id: uuid.NewString(), agentID: agentID}
 	s.mu.Lock()
 	s.sessions[state.id] = state
 	if s.sessionTimeout > 0 {
@@ -287,8 +384,19 @@ func (s *Server) expireSession(state *session) {
 }
 
 func (s *Server) sessionHandler(w http.ResponseWriter, r *http.Request) {
-	if !s.ensureAuth(w, r) {
-		return
+	// Sessions accept the shared token (CLI clients) or, in credential mode, the
+	// credential of the machine the session was opened for.
+	machineID := ""
+	if !s.authorizedShared(r) {
+		id, ok := "", false
+		if s.agentAuth != nil {
+			id, ok = s.agentAuth(bearerToken(r))
+		}
+		if !ok {
+			http.Error(w, "unauthorized", http.StatusUnauthorized)
+			return
+		}
+		machineID = id
 	}
 	id := r.URL.Query().Get("id")
 
@@ -298,6 +406,10 @@ func (s *Server) sessionHandler(w http.ResponseWriter, r *http.Request) {
 	s.mu.Unlock()
 	if state == nil {
 		http.Error(w, "invalid session", http.StatusNotFound)
+		return
+	}
+	if machineID != "" && state.agentID != machineID {
+		http.Error(w, "session belongs to another agent", http.StatusForbidden)
 		return
 	}
 	if full {

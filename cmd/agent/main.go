@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"runtime"
 	"sync"
 	"syscall"
 	"time"
@@ -27,6 +28,9 @@ import (
 	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/tlsutil"
 )
+
+// version is overridden at build time with -ldflags "-X main.version=...".
+var version = "dev"
 
 const (
 	drainTimeout = 2 * time.Second // max wait for PTY output after the shell exits
@@ -162,10 +166,15 @@ func runControl(ctx context.Context, config agentConfig) (bool, error) {
 	}
 	defer ctrl.Close()
 
+	hostname, _ := os.Hostname()
 	if err := ctrl.WriteJSON(protocol.Message{
 		Type:      protocol.TypeRegisterAgent,
 		AgentID:   config.agentID,
 		SessionID: config.agentID, // Compatibilidade com servidores anteriores.
+		Hostname:  hostname,
+		OS:        runtime.GOOS,
+		Arch:      runtime.GOARCH,
+		Version:   version,
 	}); err != nil {
 		return false, fmt.Errorf("registrar agente: %w", err)
 	}

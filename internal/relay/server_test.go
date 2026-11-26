@@ -39,25 +39,35 @@ func TestSessionPairingRelaysMessages(t *testing.T) {
 	}
 
 	requestURL := server.URL + "/client?agent=" + url.QueryEscape("agent/a")
-	request, err := http.NewRequest(http.MethodPost, requestURL, nil)
-	if err != nil {
-		t.Fatal(err)
-	}
-	request.Header.Set("Authorization", "Bearer secret")
-	response, err := http.DefaultClient.Do(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	body, err := io.ReadAll(response.Body)
-	response.Body.Close()
-	if err != nil {
-		t.Fatal(err)
+	var (
+		body     []byte
+		response *http.Response
+	)
+	// The registration is processed asynchronously; poll until the agent is known.
+	for i := 0; i < 100; i++ {
+		request, err := http.NewRequest(http.MethodPost, requestURL, nil)
+		if err != nil {
+			t.Fatal(err)
+		}
+		request.Header.Set("Authorization", "Bearer secret")
+		response, err = http.DefaultClient.Do(request)
+		if err != nil {
+			t.Fatal(err)
+		}
+		body, err = io.ReadAll(response.Body)
+		response.Body.Close()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if response.StatusCode != http.StatusNotFound {
+			break
+		}
+		time.Sleep(20 * time.Millisecond)
 	}
 	if response.StatusCode != http.StatusOK {
 		t.Fatalf("create session status = %d, body = %s", response.StatusCode, body)
 	}
 	sessionID := strings.TrimSpace(string(body))
-
 	var start protocol.Message
 	if err := agent.ReadJSON(&start); err != nil {
 		t.Fatal(err)
@@ -96,7 +106,7 @@ func TestSessionExpiresWithoutPair(t *testing.T) {
 		SessionTimeout: 20 * time.Millisecond,
 		Logger:         log.New(io.Discard, "", 0),
 	})
-	state := relayServer.createSession()
+	state := relayServer.createSession("")
 	time.Sleep(100 * time.Millisecond)
 
 	relayServer.mu.Lock()
