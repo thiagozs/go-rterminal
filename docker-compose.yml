@@ -5,11 +5,13 @@ services:
       target: server
     command: >
       sh -c '
-        args="--addr :8080 --auth-token ${AUTH_TOKEN:-change-me} --session-timeout ${SESSION_TIMEOUT:-15s}";
+        args="--addr :8080 --session-timeout ${SESSION_TIMEOUT:-15s}";
         if [ -n "${TLS_CERT:-}" ]; then args="$$args --tls-cert ${TLS_CERT:-}"; fi;
         if [ -n "${TLS_KEY:-}" ]; then args="$$args --tls-key ${TLS_KEY:-}"; fi;
         exec /usr/local/bin/server $$args
       '
+    environment:
+      RTERMINAL_TOKEN: ${AUTH_TOKEN:?defina AUTH_TOKEN com um token secreto}
     ports:
       - "8080:8080"
 
@@ -21,13 +23,15 @@ services:
       target: agent
     command: >
       sh -c '
-        args="--server-url ws://server:8080 --agent-id agent-01 --shell /bin/bash --auth-token ${AUTH_TOKEN:-change-me} --keepalive-interval ${KEEPALIVE_INTERVAL:-15s}";
+        args="--server-url ws://server:8080 --agent-id agent-01 --shell /bin/bash --keepalive-interval ${KEEPALIVE_INTERVAL:-15s}";
         if [ -n "${BACKOFF_MIN:-}" ]; then args="$$args --backoff-min ${BACKOFF_MIN:-}"; fi;
         if [ -n "${BACKOFF_MAX:-}" ]; then args="$$args --backoff-max ${BACKOFF_MAX:-}"; fi;
         if [ -n "${TLS_CA:-}" ]; then args="$$args --tls-ca ${TLS_CA:-}"; fi;
         if [ "${TLS_INSECURE:-false}" = "true" ]; then args="$$args --tls-insecure"; fi;
         exec /usr/local/bin/agent $$args
       '
+    environment:
+      RTERMINAL_TOKEN: ${AUTH_TOKEN:?defina AUTH_TOKEN com um token secreto}
 
   client:
     profiles:
@@ -40,10 +44,12 @@ services:
       target: client
     command: >
       sh -c '
-        args="--server-url http://server:8080 --agent-id agent-01 --auth-token ${AUTH_TOKEN:-change-me}";
+        args="--server-url http://server:8080 --agent-id agent-01";
         if [ -n "${TLS_CA:-}" ]; then args="$$args --tls-ca ${TLS_CA:-}"; fi;
         if [ "${TLS_INSECURE:-false}" = "true" ]; then args="$$args --tls-insecure"; fi;
         exec /usr/local/bin/client $$args
       '
+    environment:
+      RTERMINAL_TOKEN: ${AUTH_TOKEN:?defina AUTH_TOKEN com um token secreto}
     stdin_open: true
     tty: true

@@ -38,22 +38,24 @@ O codigo compartilhado fica em `internal/`:
 
 ## Como executar
 
+O token e obrigatorio e `change-me` e rejeitado. Gere um (ex: `export TOKEN=$(openssl rand -hex 32)`) ou use a variavel `RTERMINAL_TOKEN`, que evita expor o token em `ps`.
+
 1. Subir o server:
 
 ```bash
-go run ./cmd/server --addr :8080 --auth-token change-me
+go run ./cmd/server --addr :8080 --auth-token "$TOKEN"
 ```
 
 2. Subir o agent:
 
 ```bash
-go run ./cmd/agent --server-url ws://127.0.0.1:8080 --agent-id agent-01 --shell /bin/bash --auth-token change-me
+go run ./cmd/agent --server-url ws://127.0.0.1:8080 --agent-id agent-01 --shell /bin/bash --auth-token "$TOKEN"
 ```
 
 3. Subir o client:
 
 ```bash
-go run ./cmd/client --server-url http://127.0.0.1:8080 --agent-id agent-01 --auth-token change-me
+go run ./cmd/client --server-url http://127.0.0.1:8080 --agent-id agent-01 --auth-token "$TOKEN"
 ```
 
 ## Flags disponiveis
@@ -61,7 +63,7 @@ go run ./cmd/client --server-url http://127.0.0.1:8080 --agent-id agent-01 --aut
 ### server
 
 - `--addr` endereco de escuta HTTP (ex: `:8080`)
-- `--auth-token` token de autenticacao para agentes e clientes
+- `--auth-token` token de autenticacao (obrigatorio; ou `RTERMINAL_TOKEN`)
 - `--tls-cert` caminho do certificado TLS (opcional)
 - `--tls-key` caminho da chave TLS (opcional)
 - `--session-timeout` timeout para pareamento de sessao (padrao `15s`, `0` desativa)
@@ -71,18 +73,19 @@ go run ./cmd/client --server-url http://127.0.0.1:8080 --agent-id agent-01 --aut
 - `--server-url` URL WS do server (ex: `ws://127.0.0.1:8080`)
 - `--agent-id` ID do agent (ex: `agent-01`)
 - `--shell` shell para abrir no agente (ex: `/bin/bash`)
-- `--auth-token` token de autenticacao
+- `--auth-token` token de autenticacao (obrigatorio; ou `RTERMINAL_TOKEN`)
 - `--tls-ca` caminho do CA para TLS (opcional)
 - `--tls-insecure` ignora verificacao TLS (nao recomendado)
 - `--backoff-min` backoff minimo para reconexao (padrao `5s`)
 - `--backoff-max` backoff maximo para reconexao (padrao `60s`)
 - `--keepalive-interval` intervalo de keepalive no controle (padrao `15s`, `0` desativa)
+- `--max-sessions` maximo de sessoes de shell simultaneas (padrao `8`, `0` sem limite)
 
 ### client
 
 - `--server-url` URL HTTP do server (ex: `http://127.0.0.1:8080`)
 - `--agent-id` ID do agent alvo (ex: `agent-01`)
-- `--auth-token` token de autenticacao
+- `--auth-token` token de autenticacao (obrigatorio; ou `RTERMINAL_TOKEN`)
 - `--tls-ca` caminho do CA para TLS (opcional)
 - `--tls-insecure` ignora verificacao TLS (nao recomendado)
 

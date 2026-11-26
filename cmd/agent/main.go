@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"crypto/tls"
 	"encoding/json"
 	"errors"
@@ -12,16 +13,27 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
 	"github.com/creack/pty"
 	"github.com/gorilla/websocket"
 	"github.com/spf13/cobra"
+	"github.com/thiagozs/go-rterminal/internal/auth"
 	"github.com/thiagozs/go-rterminal/internal/backoff"
 	"github.com/thiagozs/go-rterminal/internal/endpoint"
 	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/tlsutil"
+)
+
+const (
+	drainTimeout = 2 * time.Second // max wait for PTY output after the shell exits
+	killGrace    = 2 * time.Second // SIGHUP to SIGKILL escalation delay
+
+	// maxPendingSessions bounds sessions that joined but are not paired yet.
+	maxPendingSessions = 64
 )
 
 func main() {
@@ -35,7 +47,8 @@ func main() {
 	rootCmd.Flags().String("server-url", "ws://127.0.0.1:8080", "URL WS do server")
 	rootCmd.Flags().String("agent-id", "agent-01", "ID do agent")
 	rootCmd.Flags().String("shell", "/bin/bash", "Shell para abrir no agente")
-	rootCmd.Flags().String("auth-token", "change-me", "Token de autenticacao")
+	rootCmd.Flags().String("auth-token", "", "Token de autenticacao (ou RTERMINAL_TOKEN)")
+	rootCmd.Flags().Int("max-sessions", 8, "Maximo de sessoes de shell simultaneas (0 = sem limite)")
 	rootCmd.Flags().String("tls-ca", "", "Caminho do CA para TLS (opcional)")
 	rootCmd.Flags().Bool("tls-insecure", false, "Ignora verificacao TLS (nao recomendado)")
 	rootCmd.Flags().Duration("backoff-min", 5*time.Second, "Backoff minimo para reconexao")
@@ -54,6 +67,10 @@ type agentConfig struct {
 	backoffMin        time.Duration
 	backoffMax        time.Duration
 	keepaliveInterval time.Duration
+	maxSessions       int
+	sessionSlots      semaphore // active shells; nil = unlimited
+	pendingSlots      semaphore // sessions waiting for a peer; nil = unlimited
+	sessions          *sync.WaitGroup
 }
 
 func runAgent(cmd *cobra.Command, _ []string) error {
@@ -61,7 +78,8 @@ func runAgent(cmd *cobra.Command, _ []string) error {
 	config.serverURL, _ = cmd.Flags().GetString("server-url")
 	config.agentID, _ = cmd.Flags().GetString("agent-id")
 	config.shellPath, _ = cmd.Flags().GetString("shell")
-	config.authToken, _ = cmd.Flags().GetString("auth-token")
+	flagToken, _ := cmd.Flags().GetString("auth-token")
+	config.maxSessions, _ = cmd.Flags().GetInt("max-sessions")
 	config.tlsCA, _ = cmd.Flags().GetString("tls-ca")
 	config.tlsInsecure, _ = cmd.Flags().GetBool("tls-insecure")
 	config.backoffMin, _ = cmd.Flags().GetDuration("backoff-min")
@@ -70,20 +88,42 @@ func runAgent(cmd *cobra.Command, _ []string) error {
 	if err := config.validate(); err != nil {
 		return err
 	}
+	token, err := auth.ResolveToken(flagToken)
+	if err != nil {
+		return err
+	}
+	config.authToken = token
+	if config.maxSessions > 0 {
+		config.sessionSlots = make(semaphore, config.maxSessions)
+	}
+	config.pendingSlots = make(semaphore, maxPendingSessions)
+
+	ctx, stop := signal.NotifyContext(cmd.Context(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+	config.sessions = &sync.WaitGroup{}
 
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	retry := backoff.New(config.backoffMin, config.backoffMax, rng)
-	for {
+	for ctx.Err() == nil {
 		log.Println("[agent] tentando conectar ao server")
-		connected, err := runControl(config)
+		connected, err := runControl(ctx, config)
+		if ctx.Err() != nil {
+			break
+		}
 		if connected {
 			retry.Reset()
 		}
 		log.Printf("[agent] conexão perdida: %v", err)
 		delay := retry.Next()
 		log.Printf("[agent] reconectando em %s", delay)
-		time.Sleep(delay)
+		select {
+		case <-time.After(delay):
+		case <-ctx.Done():
+		}
 	}
+	log.Println("[agent] encerrando, aguardando sessões ativas")
+	config.sessions.Wait()
+	return nil
 }
 
 func (c agentConfig) validate() error {
@@ -96,13 +136,16 @@ func (c agentConfig) validate() error {
 	if c.backoffMin <= 0 || c.backoffMax <= 0 || c.backoffMin > c.backoffMax {
 		return fmt.Errorf("backoff deve ser positivo e backoff-min não pode exceder backoff-max")
 	}
+	if c.maxSessions < 0 {
+		return fmt.Errorf("max-sessions não pode ser negativo")
+	}
 	if c.keepaliveInterval < 0 {
 		return fmt.Errorf("keepalive-interval não pode ser negativo")
 	}
 	return nil
 }
 
-func runControl(config agentConfig) (bool, error) {
+func runControl(ctx context.Context, config agentConfig) (bool, error) {
 	tlsConfig, err := tlsutil.ClientConfig(config.tlsCA, config.tlsInsecure)
 	if err != nil {
 		return false, err
@@ -112,8 +155,8 @@ func runControl(config agentConfig) (bool, error) {
 		return false, err
 	}
 	headers := http.Header{}
-	setAuthorization(headers, config.authToken)
-	ctrl, _, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).Dial(controlURL, headers)
+	auth.SetAuthorization(headers, config.authToken)
+	ctrl, _, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).DialContext(ctx, controlURL, headers)
 	if err != nil {
 		return false, err
 	}
@@ -132,6 +175,14 @@ func runControl(config agentConfig) (bool, error) {
 
 	keepaliveDone := startKeepalive(ctrl, config.keepaliveInterval)
 	defer close(keepaliveDone)
+	// Unblock ReadJSON when the agent is asked to stop.
+	go func() {
+		select {
+		case <-ctx.Done():
+			_ = ctrl.Close()
+		case <-keepaliveDone:
+		}
+	}()
 	for {
 		var msg protocol.Message
 		if err := ctrl.ReadJSON(&msg); err != nil {
@@ -142,7 +193,15 @@ func runControl(config agentConfig) (bool, error) {
 			continue
 		}
 		log.Printf("[agent] iniciando sessão | session=%s", msg.SessionID)
-		go runShellSession(config.serverURL, config.shellPath, msg.SessionID, config.authToken, tlsConfig)
+		if !config.pendingSlots.tryAcquire() {
+			log.Printf("[agent] muitas sessões aguardando pareamento, sessão recusada | session=%s", msg.SessionID)
+			continue
+		}
+		config.sessions.Add(1)
+		go func(sessionID string) {
+			defer config.sessions.Done()
+			runShellSession(ctx, config, sessionID, tlsConfig)
+		}(msg.SessionID)
 	}
 }
 
@@ -174,29 +233,52 @@ func startKeepalive(conn *websocket.Conn, interval time.Duration) chan struct{} 
 	return done
 }
 
-func runShellSession(serverURL, shellPath, sessionID, authToken string, tlsConfig *tls.Config) {
-	if err := shellSession(serverURL, shellPath, sessionID, authToken, tlsConfig); err != nil {
+func runShellSession(ctx context.Context, config agentConfig, sessionID string, tlsConfig *tls.Config) {
+	if err := shellSession(ctx, config, sessionID, tlsConfig); err != nil {
 		log.Printf("[agent] sessão encerrada | session=%s | err=%v", sessionID, err)
 		return
 	}
 	log.Printf("[agent] sessão encerrada | session=%s", sessionID)
 }
 
-func shellSession(serverURL, shellPath, sessionID, authToken string, tlsConfig *tls.Config) error {
-	sessionURL, err := endpoint.URL(serverURL, "/session", url.Values{"id": {sessionID}}, true)
+// shellSession joins the session on the server, waits for the peer to pair and
+// only then spawns the shell, so unpaired sessions cost no process or slot.
+func shellSession(ctx context.Context, config agentConfig, sessionID string, tlsConfig *tls.Config) error {
+	pendingReleased := false
+	releasePending := func() {
+		if !pendingReleased {
+			pendingReleased = true
+			config.pendingSlots.release()
+		}
+	}
+	defer releasePending()
+
+	sessionURL, err := endpoint.URL(config.serverURL, "/session", url.Values{"id": {sessionID}}, true)
 	if err != nil {
 		return err
 	}
 	headers := http.Header{}
-	setAuthorization(headers, authToken)
-	ws, _, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).Dial(sessionURL, headers)
+	auth.SetAuthorization(headers, config.authToken)
+	ws, _, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).DialContext(ctx, sessionURL, headers)
 	if err != nil {
 		return fmt.Errorf("conectar sessão: %w", err)
 	}
 	defer ws.Close()
 	ws.SetReadLimit(1 << 20)
 
-	command := exec.Command(shellPath)
+	if err := waitForPairing(ctx, ws); err != nil {
+		return err
+	}
+	releasePending()
+	if !config.sessionSlots.tryAcquire() {
+		log.Printf("[agent] limite de sessões atingido, sessão recusada | session=%s max=%d", sessionID, config.maxSessions)
+		_ = ws.WriteControl(websocket.CloseMessage,
+			websocket.FormatCloseMessage(websocket.CloseTryAgainLater, "agent busy: max sessions reached"), time.Now().Add(time.Second))
+		return nil
+	}
+	defer config.sessionSlots.release()
+
+	command := exec.Command(config.shellPath)
 	ptmx, err := pty.Start(command)
 	if err != nil {
 		return fmt.Errorf("iniciar PTY: %w", err)
@@ -205,24 +287,82 @@ func shellSession(serverURL, shellPath, sessionID, authToken string, tlsConfig *
 
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- command.Wait() }()
-	transferDone := make(chan error, 2)
-	go func() { transferDone <- copyPTYToWebSocket(ptmx, ws) }()
-	go func() { transferDone <- copyWebSocketToPTY(ws, ptmx) }()
+	ptyDone := make(chan error, 1)
+	wsDone := make(chan error, 1)
+	go func() { ptyDone <- copyPTYToWebSocket(ptmx, ws) }()
+	go func() { wsDone <- copyWebSocketToPTY(ws, ptmx) }()
 
+	pgid := command.Process.Pid // pty.Start makes the shell a session leader: pid == sid.
 	select {
 	case waitErr := <-waitDone:
-		_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, "shell exited"), time.Now().Add(time.Second))
-		return normalizeExitError(waitErr)
-	case transferErr := <-transferDone:
-		_ = ptmx.Close()
-		if command.Process != nil {
-			_ = command.Process.Kill()
+		// The shell exited: flush what is left in the PTY before closing, so
+		// the last output is not lost.
+		select {
+		case <-ptyDone:
+		case <-time.After(drainTimeout):
 		}
-		waitErr := <-waitDone
+		signalSession(pgid, syscall.SIGHUP)
+		closeNormally(ws, "shell exited")
+		return normalizeExitError(waitErr)
+	case transferErr := <-ptyDone:
+		waitErr := stopShell(pgid, waitDone)
+		closeNormally(ws, "shell exited")
 		if transferErr != nil && !isExpectedClose(transferErr) {
 			return transferErr
 		}
 		return normalizeExitError(waitErr)
+	case transferErr := <-wsDone:
+		_ = ptmx.Close()
+		waitErr := stopShell(pgid, waitDone)
+		if transferErr != nil && !isExpectedClose(transferErr) {
+			return transferErr
+		}
+		return normalizeExitError(waitErr)
+	case <-ctx.Done():
+		_ = ptmx.Close()
+		waitErr := stopShell(pgid, waitDone)
+		closeNormally(ws, "agent shutting down")
+		return normalizeExitError(waitErr)
+	}
+}
+
+// stopShell hangs up the shell's whole session and escalates to SIGKILL if
+// it does not exit within killGrace, so no child process is left behind.
+func stopShell(pgid int, waitDone <-chan error) error {
+	signalSession(pgid, syscall.SIGHUP)
+	select {
+	case err := <-waitDone:
+		signalSession(pgid, syscall.SIGKILL) // background jobs live in other process groups
+		return err
+	case <-time.After(killGrace):
+		signalSession(pgid, syscall.SIGKILL)
+		return <-waitDone
+	}
+}
+
+func closeNormally(ws *websocket.Conn, reason string) {
+	_ = ws.WriteControl(websocket.CloseMessage, websocket.FormatCloseMessage(websocket.CloseNormalClosure, reason), time.Now().Add(time.Second))
+}
+
+// waitForPairing blocks until the server reports the session as paired. The
+// server closes unpaired sessions after its pairing timeout.
+func waitForPairing(ctx context.Context, ws *websocket.Conn) error {
+	stop := context.AfterFunc(ctx, func() { _ = ws.Close() })
+	defer stop()
+	for {
+		var msg protocol.Message
+		if err := ws.ReadJSON(&msg); err != nil {
+			if ctx.Err() != nil {
+				return ctx.Err()
+			}
+			if websocket.IsCloseError(err, websocket.CloseNormalClosure) {
+				return errors.New("sessão expirou antes do pareamento")
+			}
+			return fmt.Errorf("aguardar pareamento: %w", err)
+		}
+		if msg.Type == protocol.TypePaired {
+			return nil
+		}
 	}
 }
 
@@ -278,8 +418,24 @@ func isExpectedClose(err error) bool {
 		websocket.IsCloseError(err, websocket.CloseNormalClosure, websocket.CloseGoingAway)
 }
 
-func setAuthorization(header http.Header, token string) {
-	if token != "" {
-		header.Set("Authorization", "Bearer "+token)
+// semaphore is a non-blocking counting limiter; a nil semaphore is unlimited.
+type semaphore chan struct{}
+
+// tryAcquire reserves a slot without blocking and reports whether it got one.
+func (s semaphore) tryAcquire() bool {
+	if s == nil {
+		return true
+	}
+	select {
+	case s <- struct{}{}:
+		return true
+	default:
+		return false
+	}
+}
+
+func (s semaphore) release() {
+	if s != nil {
+		<-s
 	}
 }

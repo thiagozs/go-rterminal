@@ -2,6 +2,7 @@ package relay
 
 import (
 	"crypto/subtle"
+	"errors"
 	"log"
 	"net/http"
 	"sync"
@@ -15,17 +16,26 @@ import (
 const (
 	registrationTimeout = 10 * time.Second
 	maxMessageSize      = 1 << 20
+	writeTimeout        = 10 * time.Second
+
+	// DefaultKeepAliveInterval is how often the server pings agents and
+	// paired sessions; a peer that stays silent for twice this long is dropped.
+	DefaultKeepAliveInterval = 20 * time.Second
 )
 
 type Config struct {
 	AuthToken      string
 	SessionTimeout time.Duration
-	Logger         *log.Logger
+	// KeepAliveInterval controls liveness pings; zero uses
+	// DefaultKeepAliveInterval and a negative value disables them.
+	KeepAliveInterval time.Duration
+	Logger            *log.Logger
 }
 
 type Server struct {
 	authToken      string
 	sessionTimeout time.Duration
+	keepAlive      time.Duration
 	logger         *log.Logger
 	upgrader       websocket.Upgrader
 
@@ -42,7 +52,16 @@ type agentConn struct {
 func (a *agentConn) writeJSON(value any) error {
 	a.writeMu.Lock()
 	defer a.writeMu.Unlock()
+	_ = a.conn.SetWriteDeadline(time.Now().Add(writeTimeout))
 	return a.conn.WriteJSON(value)
+}
+
+// alive reports whether a ping can still be written to the connection.
+func (a *agentConn) alive() bool {
+	if a.conn == nil {
+		return false
+	}
+	return a.conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) == nil
 }
 
 type session struct {
@@ -56,7 +75,12 @@ func New(config Config) *Server {
 	if logger == nil {
 		logger = log.Default()
 	}
+	keepAlive := config.KeepAliveInterval
+	if keepAlive == 0 {
+		keepAlive = DefaultKeepAliveInterval
+	}
 	return &Server{
+		keepAlive:      keepAlive,
 		authToken:      config.AuthToken,
 		sessionTimeout: config.SessionTimeout,
 		logger:         logger,
@@ -132,13 +156,20 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 	_ = ws.SetReadDeadline(time.Time{})
 
 	agent := &agentConn{conn: ws}
-	if previous := s.setAgent(msg.AgentID, agent); previous != nil {
-		closeWebSocket(previous.conn, websocket.CloseNormalClosure, "agent replaced")
-		s.logger.Printf("[server] conexão anterior substituída | agent=%s", msg.AgentID)
+	replaced, ok := s.registerAgent(msg.AgentID, agent)
+	if !ok {
+		s.logger.Printf("[server] registro recusado, agente já conectado | agent=%s", msg.AgentID)
+		closeWebSocket(ws, websocket.ClosePolicyViolation, "agent already connected")
+		return
+	}
+	if replaced != nil {
+		closeWebSocket(replaced.conn, websocket.CloseNormalClosure, "agent replaced")
+		s.logger.Printf("[server] conexão inativa substituída | agent=%s", msg.AgentID)
 	}
 	defer s.removeAgent(msg.AgentID, agent)
 
 	s.logger.Printf("[server] agente conectado | agent=%s", msg.AgentID)
+	defer s.startKeepAlive(ws)()
 	for {
 		if _, _, err := ws.ReadMessage(); err != nil {
 			s.logger.Printf("[server] agente desconectado | agent=%s", msg.AgentID)
@@ -147,12 +178,31 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (s *Server) setAgent(id string, agent *agentConn) *agentConn {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	previous := s.agents[id]
-	s.agents[id] = agent
-	return previous
+// registerAgent claims id for agent. An existing registration is kept (and ok
+// is false) while its connection still answers a ping, so a token holder
+// cannot hijack a live agent; a dead connection is replaced and returned.
+func (s *Server) registerAgent(id string, agent *agentConn) (replaced *agentConn, ok bool) {
+	for {
+		s.mu.Lock()
+		previous := s.agents[id]
+		if previous == nil {
+			s.agents[id] = agent
+			s.mu.Unlock()
+			return nil, true
+		}
+		s.mu.Unlock()
+
+		if previous.alive() {
+			return nil, false
+		}
+		s.mu.Lock()
+		if s.agents[id] == previous {
+			s.agents[id] = agent
+			s.mu.Unlock()
+			return previous, true
+		}
+		s.mu.Unlock()
+	}
 }
 
 func (s *Server) removeAgent(id string, expected *agentConn) {
@@ -167,8 +217,8 @@ func (s *Server) clientHandler(w http.ResponseWriter, r *http.Request) {
 	if !s.ensureAuth(w, r) {
 		return
 	}
-	if r.Method != http.MethodPost && r.Method != http.MethodGet {
-		w.Header().Set("Allow", "GET, POST")
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", http.MethodPost)
 		http.Error(w, "method not allowed", http.StatusMethodNotAllowed)
 		return
 	}
@@ -293,23 +343,90 @@ func (s *Server) bridgePair(id string, a, b *websocket.Conn) {
 			s.logger.Printf("[server] sessão encerrada | session=%s", id)
 		})
 	}
+	defer s.startKeepAlive(a)()
+	defer s.startKeepAlive(b)()
+	// Tell both ends the peer is there; the agent only starts a shell now.
+	paired := protocol.Message{Type: protocol.TypePaired, SessionID: id}
+	for _, conn := range []*websocket.Conn{a, b} {
+		_ = conn.SetWriteDeadline(time.Now().Add(writeTimeout))
+		if err := conn.WriteJSON(paired); err != nil {
+			closePair()
+			return
+		}
+	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); defer closePair(); relayMessages(a, b) }()
-	go func() { defer wg.Done(); defer closePair(); relayMessages(b, a) }()
+	go func() { defer wg.Done(); defer closePair(); s.relayMessages(a, b) }()
+	go func() { defer wg.Done(); defer closePair(); s.relayMessages(b, a) }()
 	wg.Wait()
 }
 
-func relayMessages(src, dst *websocket.Conn) {
+func (s *Server) relayMessages(src, dst *websocket.Conn) {
 	for {
 		messageType, data, err := src.ReadMessage()
 		if err != nil {
+			forwardClose(dst, err)
 			return
 		}
+		s.extendReadDeadline(src)
+		_ = dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := dst.WriteMessage(messageType, data); err != nil {
 			return
 		}
 	}
+}
+
+// startKeepAlive pings conn periodically and arms a read deadline that every
+// pong (or relayed message) pushes forward, so half-open peers are detected
+// by the connection's read loop. It must be called before that loop starts
+// reading and returns a function that stops the pinger.
+func (s *Server) startKeepAlive(conn *websocket.Conn) (stop func()) {
+	if s.keepAlive < 0 {
+		return func() {}
+	}
+	s.extendReadDeadline(conn)
+	conn.SetPongHandler(func(string) error {
+		s.extendReadDeadline(conn)
+		return nil
+	})
+	done := make(chan struct{})
+	go func() {
+		ticker := time.NewTicker(s.keepAlive)
+		defer ticker.Stop()
+		for {
+			select {
+			case <-done:
+				return
+			case <-ticker.C:
+				if conn.WriteControl(websocket.PingMessage, nil, time.Now().Add(time.Second)) != nil {
+					_ = conn.Close()
+					return
+				}
+			}
+		}
+	}()
+	return func() { close(done) }
+}
+
+func (s *Server) extendReadDeadline(conn *websocket.Conn) {
+	if s.keepAlive > 0 {
+		_ = conn.SetReadDeadline(time.Now().Add(2 * s.keepAlive))
+	}
+}
+
+// forwardClose passes a peer's close code and reason on to the other end, so
+// reasons such as "agent busy" reach the client. Codes that must not appear on
+// the wire (no status, abnormal closure, TLS failure) are not forwarded.
+func forwardClose(dst *websocket.Conn, err error) {
+	var closeErr *websocket.CloseError
+	if !errors.As(err, &closeErr) {
+		return
+	}
+	switch closeErr.Code {
+	case websocket.CloseNoStatusReceived, websocket.CloseAbnormalClosure, websocket.CloseTLSHandshake:
+		return
+	}
+	closeWebSocket(dst, closeErr.Code, closeErr.Text)
 }
 
 func closeWebSocket(conn *websocket.Conn, code int, reason string) {

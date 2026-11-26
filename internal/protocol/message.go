@@ -4,6 +4,8 @@ const (
 	TypeRegisterAgent = "register-agent"
 	TypeStartSession  = "start-session"
 	TypeResize        = "resize"
+	// TypePaired is sent by the server to both ends once a session is paired.
+	TypePaired = "paired"
 )
 
 type Message struct {
