@@ -94,7 +94,7 @@ async function refresh() {
 function startPolling() {
   stopPolling();
   state.timer = setInterval(async () => {
-    if (!state.user || state.view !== "machines" || document.querySelector(".overlay, .term-overlay")) return;
+    if (!state.user || state.view !== "machines" || document.querySelector(".overlay, .term-overlay:not([hidden])")) return;
     try { await refresh(); render(); } catch (_) { /* surfaced on next action */ }
   }, 5000);
 }
@@ -105,7 +105,7 @@ function render() {
   const app = document.getElementById("app");
   if (!state.user) app.replaceChildren(loginView());
   else if (state.mustChange) app.replaceChildren(forcedPasswordView());
-  else app.replaceChildren(shell());
+  else { app.replaceChildren(shell()); openPopupIfRequested(); }
 }
 
 function loginView() {
@@ -145,6 +145,7 @@ function shell() {
       h("span", { class: "brand" }, "GO-RTERMINAL"),
       h("nav", { class: "nav" }, navBtn("machines", "Máquinas"), navBtn("audit", "Auditoria")),
       h("span", { class: "spacer" }),
+      workspace && h("button", { class: "btn small primary", title: "Voltar aos terminais abertos", onclick: () => workspace.show() }, `Terminais (${workspace.count()})`),
       h("span", { class: "muted" }, state.user),
       h("button", { class: "btn small", onclick: () => passwordModal() }, "Alterar senha"),
       h("button", { class: "btn small", onclick: logout }, "Sair"),
@@ -580,11 +581,42 @@ function escapeBytes(text) {
   return out;
 }
 
+// --- terminal workspace ---
+// One overlay holds several terminal sessions ("panes"). Tabs pick the visible
+// one; the split layouts show every session at once. Each pane owns its own
+// WebSocket, so each tab is an independent shell on its machine.
+const TERM_LAYOUT_KEY = "rt.term.layout"; // tabs | cols | rows | grid
+const LAYOUTS = [["tabs", "Abas"], ["cols", "Lado a lado"], ["rows", "Empilhados"], ["grid", "Grade"]];
+let workspace = null;
+
+// A window opened with the popup button carries #popup=<machine id>: it shows
+// just that machine's terminal, full window.
+const popupId = location.hash.startsWith("#popup=") ? decodeURIComponent(location.hash.slice(7)) : "";
+let popupOpened = false;
+
+function openPopupIfRequested() {
+  if (!popupId || popupOpened) return;
+  popupOpened = true;
+  const m = state.machines.find((x) => x.id === popupId);
+  if (!m) { toast("Máquina não encontrada.", "err"); return; }
+  document.title = m.name;
+  workspace = createWorkspace(true);
+  workspace.add(m);
+  workspace.show();
+}
+
 function openTerminal(machine) {
+  if (!workspace) workspace = createWorkspace(false);
+  workspace.add(machine);
+  workspace.show();
+}
+
+// createPane builds one terminal session. hooks: onState(state), onClose().
+function createPane(machine, label, hooks) {
   const status = h("span", { class: "muted" }, "conectando…");
   const reconnect = h("button", { class: "btn small", hidden: true }, "Reconectar");
-  const host = h("div", { id: "term" });
-  let term = null, fit = null, ws = null, ended = false, webgl = null;
+  const host = h("div", { class: "term" });
+  let term = null, fit = null, ws = null, ended = false, webgl = null, observer = null;
   // Diagnostics: records what the terminal sends and receives (see traceModal).
   const trace = { on: false, started: 0, lines: [] };
   const decoder = new TextDecoder("utf-8", { fatal: false });
@@ -593,22 +625,25 @@ function openTerminal(machine) {
     if (trace.lines.length >= 3000) trace.lines.shift();
     trace.lines.push(`${String(Math.round(performance.now() - trace.started)).padStart(6)}ms ${dir} ${escapeBytes(text)}`);
   };
-  const overlay = h("div", { class: "term-overlay" },
-    h("div", { class: "term-bar" },
-      h("span", { class: "brand" }, machine.name),
-      status, h("span", { class: "spacer" }), reconnect,
+  const title = h("strong", null, label);
+  const el = h("section", { class: "term-pane" },
+    h("div", { class: "pane-bar" },
+      title, status, h("span", { class: "spacer" }), reconnect,
       h("button", { class: "btn small", title: "Grava o que o terminal envia e recebe, para investigar problemas de exibição", onclick: () => traceModal() }, "Diagnóstico"),
-      h("button", { class: "btn small", title: "Fonte e tamanho do terminal", onclick: () => fontModal(applyFont) }, "Fonte"),
-      h("button", { class: "btn small", onclick: () => end() }, "Fechar")),
+      h("button", { class: "btn small", title: "Fechar este terminal", onclick: () => hooks.onClose() }, "✕")),
     h("div", { class: "term-host" }, host));
-  document.body.append(overlay);
 
   const enc = new TextEncoder();
+  const setState = (s, text) => { status.textContent = text; hooks.onState(s); };
   const sendResize = () => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
   };
-  const onWindowResize = () => { if (fit) fit.fit(); };
-  const onEsc = (e) => { if (e.key === "Escape" && e.shiftKey) end(); };
+  let fitQueued = false;
+  const queueFit = () => {
+    if (fitQueued || !fit) return;
+    fitQueued = true;
+    requestAnimationFrame(() => { fitQueued = false; if (!ended && host.offsetWidth > 0) fit.fit(); });
+  };
 
   // setRenderer switches between the DOM renderer and the WebGL (canvas) one.
   function setRenderer() {
@@ -633,13 +668,13 @@ function openTerminal(machine) {
     term.options.fontFamily = termFontFamily();
     term.options.fontSize = termFontSize();
     setRenderer();
-    fit.fit();
+    queueFit();
     sendResize();
   }
 
   function connect() {
     reconnect.hidden = true;
-    status.textContent = "conectando…";
+    setState("connecting", "conectando…");
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
     ws = new WebSocket(`${proto}//${location.host}/ws/terminal?machine=${encodeURIComponent(machine.id)}`);
     ws.binaryType = "arraybuffer";
@@ -647,7 +682,7 @@ function openTerminal(machine) {
       if (typeof ev.data === "string") {
         let msg = null;
         try { msg = JSON.parse(ev.data); } catch (_) { return; }
-        if (msg.type === "paired") { status.textContent = "conectado"; fit.fit(); sendResize(); }
+        if (msg.type === "paired") { setState("on", "conectado"); queueFit(); sendResize(); }
         return;
       }
       const bytes = new Uint8Array(ev.data);
@@ -655,13 +690,14 @@ function openTerminal(machine) {
       term.write(bytes);
     };
     ws.onclose = (ev) => {
-      status.textContent = "desconectado";
+      setState("off", "desconectado");
       term.write(`\r\n\x1b[33m[sessão encerrada${ev.reason ? ": " + ev.reason : ""}]\x1b[0m\r\n`);
       reconnect.hidden = false;
     };
-    ws.onerror = () => { status.textContent = "erro de conexão"; };
+    ws.onerror = () => setState("off", "erro de conexão");
   }
 
+  // start must run once el is attached to the document.
   function start() {
     if (ended) return;
     term = new Terminal({
@@ -674,15 +710,16 @@ function openTerminal(machine) {
     term.attachCustomKeyEventHandler(terminalKeyHandler(term));
     setRenderer();
     fit.fit();
-    term.focus();
     term.onData((d) => {
       record(">", d);
       if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d));
     });
     term.onResize(sendResize);
-    window.addEventListener("resize", onWindowResize);
-    document.addEventListener("keydown", onEsc);
-    reconnect.addEventListener("click", () => { term.clear(); connect(); });
+    // Refit whenever the pane's box changes: window resize, layout switch,
+    // tab shown again after being hidden.
+    observer = new ResizeObserver(queueFit);
+    observer.observe(host);
+    reconnect.addEventListener("click", () => { term.clear(); connect(); term.focus(); });
     connect();
   }
 
@@ -727,17 +764,147 @@ function openTerminal(machine) {
     );
   }
 
-  function end() {
+  function dispose() {
     ended = true;
-    window.removeEventListener("resize", onWindowResize);
-    document.removeEventListener("keydown", onEsc);
+    if (observer) observer.disconnect();
     if (ws) { ws.onclose = null; ws.close(); }
     if (term) term.dispose();
-    overlay.remove();
-    refresh().then(render).catch(() => {});
+    el.remove();
   }
 
-  loadTerminalFonts().then(start);
+  return { el, machine, start, applyFont, dispose, focus: () => term && term.focus() };
+}
+
+// createWorkspace builds the overlay with the tab bar, layout switch and panes.
+function createWorkspace(popup) {
+  const tabs = [];       // {id, label, pane, state}
+  const counters = {};   // machine id -> sessions opened so far (for "#2" labels)
+  let active = null, nextId = 1, layout = stored(TERM_LAYOUT_KEY);
+  if (!LAYOUTS.some(([v]) => v === layout)) layout = "tabs";
+
+  const tabBar = h("div", { class: "term-tabs", role: "tablist" });
+  const grid = h("div", { class: "term-grid" });
+  const picker = h("select", { class: "pick", title: "Abrir outro terminal", "aria-label": "Abrir outro terminal" });
+  const layoutSel = h("select", { class: "pick", title: "Disposição dos terminais", "aria-label": "Disposição dos terminais",
+    onchange: () => { layout = layoutSel.value; store(TERM_LAYOUT_KEY, layout); applyLayout(); } },
+    ...LAYOUTS.map(([v, t]) => h("option", { value: v, selected: v === layout }, t)));
+
+  const fillPicker = () => {
+    picker.replaceChildren(h("option", { value: "" }, "+ Novo terminal…"),
+      ...state.machines.filter((m) => m.online).map((m) => h("option", { value: m.id }, m.name)));
+  };
+  picker.addEventListener("focus", () => { refresh().then(fillPicker).catch(() => {}); });
+  picker.addEventListener("change", () => {
+    const m = state.machines.find((x) => x.id === picker.value);
+    fillPicker();
+    if (m) api_add(m);
+  });
+  fillPicker();
+
+  const popoutBtn = h("button", { class: "btn small", title: "Abre uma nova sessão desta máquina em outra janela",
+    onclick: () => {
+      if (!active) return;
+      const url = `${location.pathname}#popup=${encodeURIComponent(active.pane.machine.id)}`;
+      if (!window.open(url, "_blank", "popup=yes,width=1100,height=700")) toast("O navegador bloqueou a janela; libere pop-ups para este site.", "err");
+    } }, "Popup");
+
+  const overlay = h("div", { class: "term-overlay" },
+    h("div", { class: "term-bar" },
+      h("span", { class: "brand" }, popup ? "Terminal" : "Terminais"),
+      tabBar, popup ? null : picker, h("span", { class: "spacer" }),
+      layoutSel,
+      !popup && popoutBtn,
+      h("button", { class: "btn small", title: "Fonte e tamanho do terminal", onclick: () => fontModal(() => tabs.forEach((t) => t.pane.applyFont())) }, "Fonte"),
+      !popup && h("button", { class: "btn small", title: "Volta para a lista; os terminais continuam conectados", onclick: () => ws_.hide() }, "Minimizar"),
+      h("button", { class: "btn small", title: popup ? "Fechar a janela" : "Encerra todos os terminais", onclick: () => ws_.closeAll() }, popup ? "Fechar" : "Encerrar todos")),
+    grid);
+  overlay.hidden = true;
+  document.body.append(overlay);
+
+  function renderTabs() {
+    tabBar.replaceChildren(...tabs.map((t) => h("div", { class: "term-tab" + (t === active ? " active" : ""), role: "tab", "aria-selected": String(t === active) },
+      h("button", { class: "tab-name", title: t.label, onclick: () => activate(t) },
+        h("span", { class: "dot" + (t.state === "on" ? " on" : "") }), t.label),
+      h("button", { class: "tab-x", title: "Fechar este terminal", "aria-label": "Fechar " + t.label, onclick: () => close(t) }, "✕"))));
+  }
+
+  function applyLayout() {
+    layoutSel.value = layout;
+    const n = tabs.length || 1;
+    let cols = 1, rows = 1;
+    if (layout === "cols") cols = n;
+    else if (layout === "rows") rows = n;
+    else if (layout === "grid") { cols = Math.ceil(Math.sqrt(n)); rows = Math.ceil(n / cols); }
+    grid.style.gridTemplateColumns = `repeat(${cols}, minmax(0, 1fr))`;
+    grid.style.gridTemplateRows = `repeat(${rows}, minmax(0, 1fr))`;
+    for (const t of tabs) {
+      t.pane.el.hidden = layout === "tabs" && t !== active;
+      t.pane.el.classList.toggle("active", t === active && layout !== "tabs");
+    }
+  }
+
+  function activate(t, focus = true) {
+    if (active === t) { if (focus) t.pane.focus(); return; }
+    active = t;
+    applyLayout();
+    renderTabs();
+    if (focus) t.pane.focus();
+  }
+
+  function add(machine) {
+    counters[machine.id] = (counters[machine.id] || 0) + 1;
+    const label = counters[machine.id] > 1 ? `${machine.name} #${counters[machine.id]}` : machine.name;
+    const t = { id: nextId++, label, state: "connecting", pane: null };
+    t.pane = createPane(machine, label, {
+      onState: (s) => { t.state = s; renderTabs(); },
+      onClose: () => close(t),
+    });
+    t.pane.el.addEventListener("focusin", () => activate(t, false));
+    tabs.push(t);
+    grid.append(t.pane.el);
+    active = t;
+    applyLayout();
+    renderTabs();
+    // xterm measures its cell size, so it can only start once attached and with the fonts loaded.
+    loadTerminalFonts().then(() => { t.pane.start(); if (active === t) t.pane.focus(); });
+  }
+  const api_add = (m) => { add(m); };
+
+  function close(t) {
+    const i = tabs.indexOf(t);
+    if (i < 0) return;
+    tabs.splice(i, 1);
+    t.pane.dispose();
+    if (!tabs.length) { ws_.destroy(); return; }
+    if (active === t) active = tabs[Math.min(i, tabs.length - 1)];
+    applyLayout();
+    renderTabs();
+    active.pane.focus();
+  }
+
+  const ws_ = {
+    add,
+    show() {
+      overlay.hidden = false;
+      fillPicker();
+      if (active) active.pane.focus();
+    },
+    hide() { overlay.hidden = true; render(); },
+    closeAll() {
+      if (tabs.length > 1 && !confirm(`Encerrar ${tabs.length} terminais?`)) return;
+      ws_.destroy();
+    },
+    destroy() {
+      tabs.splice(0).forEach((t) => t.pane.dispose());
+      overlay.remove();
+      workspace = null;
+      if (popup) { window.close(); return; }
+      refresh().then(render).catch(() => render());
+    },
+    count: () => tabs.length,
+    visible: () => !overlay.hidden,
+  };
+  return ws_;
 }
 
 // --- audit ---

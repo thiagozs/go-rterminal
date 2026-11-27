@@ -140,6 +140,16 @@ Como funciona:
 
 Limites desta versao: ha um unico papel (administrador); os grupos organizam as maquinas, mas ainda nao restringem acesso. Nao ha rede entre as maquinas (IP, ping): isso e outro produto. Use HTTPS (`--tls-cert`/`--tls-key` ou um proxy como acima): sem TLS, a senha e as credenciais trafegam em texto puro, e o server avisa no log.
 
+### Varios terminais: abas, divisao e popup
+
+O botao **Terminal** abre o espaco de terminais. Cada terminal e uma sessao independente (shell proprio, WebSocket proprio) e o agent aceita varias ao mesmo tempo por maquina.
+
+- **Abas**: use **+ Novo terminal...** para abrir outra sessao, na mesma maquina ou em outra (so as online aparecem). Repetidas viram `Maquina #2`, `#3`. O ponto verde mostra a sessao conectada; o `✕` fecha so aquele terminal.
+- **Disposicao**: o seletor alterna entre **Abas** (um por vez), **Lado a lado**, **Empilhados** e **Grade**. Nas divisoes todos ficam visiveis e cada um se ajusta ao seu tamanho; clique em um para dar foco (borda azul). A escolha fica salva no navegador.
+- **Popup**: abre **uma nova sessao** da maquina da aba ativa em outra janela (util para outro monitor). A janela mostra so o terminal, fecha a sessao ao fechar e o navegador precisa liberar pop-ups para o site. Uma sessao ja aberta nao muda de janela.
+- **Minimizar** volta para a lista de maquinas sem desconectar nada (o botao **Terminais (n)** no topo reabre); **Encerrar todos** fecha todas as sessoes.
+- Fonte, tamanho e renderizador valem para todos os terminais. Com muitos terminais, prefira o renderizador padrao (DOM) ao WebGL.
+
 ### Terminal no navegador: fontes e ambiente
 
 O botao **Terminal** abre um shell da maquina no navegador (xterm.js). Prompts como o Spaceship e ferramentas como o eza usam icones **Nerd Font / Font Awesome / Powerline**, e o navegador so enxerga as fontes instaladas **no computador de quem esta vendo o painel**. Por isso:

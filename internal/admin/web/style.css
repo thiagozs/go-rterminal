@@ -89,10 +89,24 @@ pre.cmd { margin: 0; background: #0d0e18; border: 1px solid var(--slate); border
 .row { display: flex; gap: 8px; align-items: center; margin-top: 8px; }
 
 /* terminal */
+[hidden] { display: none !important; }
 .term-overlay { position: fixed; inset: 0; z-index: 20; display: grid; grid-template-rows: auto 1fr; background: var(--ink); }
-.term-bar { display: flex; align-items: center; gap: 12px; padding: 8px 14px; background: var(--dusk); border-bottom: 2px solid var(--slate); }
-.term-host { padding: 10px; min-height: 0; }
-#term { height: 100%; }
+.term-bar { display: flex; align-items: center; gap: 12px; padding: 6px 14px; background: var(--dusk); border-bottom: 2px solid var(--slate); min-width: 0; }
+.term-tabs { display: flex; gap: 4px; overflow-x: auto; min-width: 0; }
+.term-tab { display: flex; align-items: center; background: var(--ink); border: 1px solid var(--slate); border-radius: 4px; flex: none; }
+.term-tab.active { background: var(--blue); border-color: var(--sky); }
+.term-tab button { background: none; border: none; color: inherit; cursor: pointer; padding: 5px 8px; font: inherit; }
+.term-tab .tab-name { display: flex; align-items: center; gap: 6px; max-width: 180px; overflow: hidden; white-space: nowrap; text-overflow: ellipsis; }
+.term-tab .tab-x { padding: 5px 7px; color: var(--silver); }
+.term-tab .tab-x:hover { color: var(--white); }
+.term-tab .dot { flex: none; }
+.term-bar .pick { width: auto; padding: 4px 8px; }
+.term-grid { display: grid; gap: 4px; padding: 4px; min-height: 0; min-width: 0; }
+.term-pane { display: grid; grid-template-rows: auto 1fr; min-height: 0; min-width: 0; border: 1px solid var(--dusk); border-radius: 4px; overflow: hidden; }
+.term-pane.active { border-color: var(--sky); }
+.pane-bar { display: flex; align-items: center; gap: 10px; padding: 3px 8px; background: var(--dusk); }
+.term-host { padding: 6px; min-height: 0; min-width: 0; overflow: hidden; }
+.term { height: 100%; }
 
 /* auditoria */
 .audit td { font-size: 13px; }
