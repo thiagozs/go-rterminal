@@ -33,9 +33,22 @@ func (l *loginLimiter) recent(key string, now time.Time) []time.Time {
 }
 
 func (l *loginLimiter) allow(key string) bool {
+	blocked, _ := l.blocked(key)
+	return !blocked
+}
+
+// blocked reports whether key has reached its failure limit and, if so, how
+// long until the oldest counted failure expires and an attempt is allowed again.
+func (l *loginLimiter) blocked(key string) (bool, time.Duration) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
-	return len(l.recent(key, time.Now())) < l.max
+	now := time.Now()
+	recent := l.recent(key, now)
+	if len(recent) < l.max {
+		return false, 0
+	}
+	// recent is oldest-first; once the (len-max+1)-th oldest ages out, the count drops below max.
+	return true, recent[len(recent)-l.max].Add(l.window).Sub(now)
 }
 
 func (l *loginLimiter) fail(key string) {

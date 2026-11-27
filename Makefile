@@ -1,9 +1,11 @@
-.PHONY: require-token run-server-admin help build build-server build-agent build-client run-server run-agent run-client healthcheck
+.PHONY: require-token run-server-admin image-server push-server help build build-server build-agent build-client run-server run-agent run-client healthcheck
 
 GO ?= go
 BIN_DIR ?= bin
 AUTH_TOKEN ?=
 DB ?= rterminal.db
+IMAGE ?= thiagozs/go-rterminal
+IMAGE_TAG ?= server-$(shell date +%Y%m%d)
 PUBLIC_URL ?=
 TLS_CERT ?=
 TLS_KEY ?=
@@ -26,6 +28,8 @@ help:
 	@echo "  build-client  Build client binary"
 	@echo "  run-server    Run server (go run)"
 	@echo "  run-server-admin  Run server with the admin panel (SQLite, no AUTH_TOKEN needed)"
+	@echo "  image-server  Build the server Docker image ($(IMAGE):server, :latest and a dated tag)"
+	@echo "  push-server   Push the server image tags to the registry"
 	@echo "  run-agent     Run agent (go run)"
 	@echo "  run-client    Run client (go run)"
 	@echo "  healthcheck   Check server health endpoint"
@@ -66,6 +70,14 @@ run-server-admin:
 		$(if $(PUBLIC_URL),--public-url $(PUBLIC_URL),) \
 		$(if $(TLS_CERT),--tls-cert $(TLS_CERT),) \
 		$(if $(TLS_KEY),--tls-key $(TLS_KEY),)
+
+image-server:
+	docker build --target server --build-arg VERSION=$(IMAGE_TAG) -t $(IMAGE):server -t $(IMAGE):latest -t $(IMAGE):$(IMAGE_TAG) .
+
+push-server:
+	docker push $(IMAGE):server
+	docker push $(IMAGE):latest
+	docker push $(IMAGE):$(IMAGE_TAG)
 
 run-agent: require-token
 	$(GO) run ./cmd/agent --server-url ws://127.0.0.1:8080 --agent-id agent-01 \

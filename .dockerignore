@@ -1,0 +1,14 @@
+# Keep the build context to what the Go build needs: faster builds, and edits to
+# docs or deploy files no longer invalidate the build cache.
+.git
+.gitignore
+bin/
+docs/
+deploy/
+*.md
+Makefile
+docker-compose.yml
+*.db
+*.db-wal
+*.db-shm
+.playwright-cli/

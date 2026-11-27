@@ -126,10 +126,10 @@ Entre em `http://localhost:8080/` com ela: a interface pede uma senha nova (mini
 
 1. Crie o grupo (ex: `homelab`) em **Grupos > + Novo**.
 2. Clique em **+ Adicionar maquina**, informe o nome (ex: `Raspberry Pi`) e o grupo.
-3. A interface mostra o comando para rodar na maquina (binario, servico systemd e instalacao do agent). Ele carrega a **credencial da maquina**, exibida so uma vez.
-4. Rode o comando na maquina. Ela aparece como **online**, com hostname, SO e arquitetura, e o botao **Terminal** abre um shell no navegador.
+3. A interface mostra o comando para rodar na maquina: **Linux (systemd)**, que instala o agent como servico, ou **Executar agora**, que roda em primeiro plano (Linux ou macOS). Ele carrega a **credencial da maquina**, exibida so uma vez.
+4. Rode o comando na maquina. Ele **baixa o agent do proprio server**, ja para a arquitetura da maquina (veja [Download do agent](#download-do-agent)). Ela aparece como **online**, com hostname, SO e arquitetura, e o botao **Terminal** abre um shell no navegador.
 
-O comando gerado tem a forma `RTERMINAL_TOKEN=<credencial> agent --server-url wss://... --agent-id raspberry-pi`. Use `--public-url` para o endereco externo correto (principalmente atras de proxy reverso); sem ele, usa o host da requisicao.
+Use `--public-url` para o endereco externo correto (principalmente atras de proxy reverso); sem ele, usa o host da requisicao.
 
 Como funciona:
 
@@ -140,22 +140,67 @@ Como funciona:
 
 Limites desta versao: ha um unico papel (administrador); os grupos organizam as maquinas, mas ainda nao restringem acesso. Nao ha rede entre as maquinas (IP, ping): isso e outro produto. Use HTTPS (`--tls-cert`/`--tls-key` ou um proxy como acima): sem TLS, a senha e as credenciais trafegam em texto puro, e o server avisa no log.
 
-Para Raspberry e outras arquiteturas, compile o agent com `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build ./cmd/agent` (ou `GOARCH=arm` para ARMv7), ou use `docker buildx build --platform linux/arm64 --target agent .`.
+### Terminal no navegador: fontes e ambiente
+
+O botao **Terminal** abre um shell da maquina no navegador (xterm.js). Prompts como o Spaceship e ferramentas como o eza usam icones **Nerd Font / Font Awesome / Powerline**, e o navegador so enxerga as fontes instaladas **no computador de quem esta vendo o painel**. Por isso:
+
+- O painel traz embutida a fonte de simbolos *Symbols Nerd Font Mono* (MIT) como reserva: os icones aparecem mesmo sem nenhuma fonte instalada.
+- Para ficar identico ao seu terminal local, clique em **Fonte** na barra do terminal e informe o nome da sua Nerd Font (ex: `MesloLGS NF`, `JetBrainsMono Nerd Font`) e o tamanho. A escolha fica salva no navegador. Varias fontes comuns ja sao tentadas automaticamente.
+- O shell abre em modo `xterm-256color` e `COLORTERM=truecolor`. Como um servico do systemd nao define quase nada, o agent completa o ambiente do shell quando falta: `TERM`, `HOME`, `USER`, `LOGNAME`, `SHELL`, `PATH`, locale UTF-8 (`C.UTF-8`; `en_US.UTF-8` no macOS), e abre a sessao no diretorio `HOME`. Valores ja definidos (por exemplo no `.env` do servico) nunca sao sobrescritos.
+- **Copiar e colar**: com texto selecionado, `Ctrl+C` (ou `Cmd+C`) copia; sem selecao, `Ctrl+C` interrompe o comando, como num terminal comum. `Ctrl+Shift+C` sempre copia. `Ctrl+V`, `Ctrl+Shift+V` (e o menu do botao direito) colam. Selecione com o mouse (arrastar, duplo clique para palavra, triplo clique para a linha).
+- **Renderizador**: o padrao desenha o texto com elementos do DOM. Se algo aparecer fora do lugar (texto repetido, glifos sobrepostos), abra **Fonte** e escolha **WebGL**, que desenha em canvas. A escolha fica salva no navegador.
+- **Diagnostico**: o botao grava o que o terminal envia e recebe (com `\e` e `\b` visiveis) e mostra o buffer interno do xterm, para comparar o que ele guarda com o que aparece na tela. Util para investigar problemas de exibicao. Nao grave senhas.
+- O shell e o definido por `--shell` (padrao `/bin/bash`). Para abrir direto no zsh com Oh My Zsh, use `--shell /usr/bin/zsh` (ou o caminho de `which zsh`) no servico do agent e o usuario que roda o servico deve ter o `~/.zshrc` configurado.
+
+### Download do agent
+
+A imagem do server leva o agent compilado para `linux/amd64`, `linux/arm64`, `linux/arm` (ARMv6 e superiores, como todos os Raspberry Pi), `darwin/amd64` e `darwin/arm64`, e os distribui em `GET /download/agent/<os>-<arch>`. O comando gerado pelo painel:
+
+1. detecta a arquitetura com `uname -m`;
+2. baixa o binario certo, autenticando com a **credencial da maquina** (enviada ao `curl` por stdin, entao nao aparece no `ps`);
+3. instala em `/usr/local/bin/agent` (troca atomica, entao reexecutar o comando atualiza o agent) e, no modo systemd, cria e reinicia o servico.
+
+**Versao e atualizacao.** O agent informa a sua versao ao conectar e o painel a mostra na tabela, com o aviso **desatualizado** quando ela difere da do server (a imagem Docker grava a mesma versao no server e nos agents que distribui). O botao **Atualizar agent** mostra um comando que baixa o agent atual e reinicia o servico reaproveitando a credencial ja salva em `/etc/rterminal-agent.env`, sem trocar a credencial. Atencao: o ambiente do shell (`TERM`, `HOME`, UTF-8) e montado pelo **agent**; um agent antigo abre shells sem `TERM`, e o zsh entao nao consegue mover o cursor (sintoma: caracteres digitados repetidos no prompt). Atualize os agents sempre que atualizar o server.
+
+O endpoint tambem aceita o login do administrador (para baixar pelo navegador). Credenciais invalidas sao limitadas por IP, a lista de alvos e fixa (nada de caminhos livres) e cada download aparece na auditoria. Windows nao e suportado (o agent usa PTY).
+
+A pasta de binarios vem de `--agents-dir` ou `RTERMINAL_AGENTS_DIR` (a imagem Docker ja a define). Ao rodar o server com `go run`, sem essa pasta, o download fica desativado e os comandos gerados assumem o `agent` ja instalado; para gerar os binarios na mao: `GOOS=linux GOARCH=arm64 CGO_ENABLED=0 go build -o agents/agent-linux-arm64 ./cmd/agent` (um arquivo `agent-<os>-<arch>` por plataforma).
 
 ### Deploy com Docker (Portainer + nginx-proxy)
 
-`deploy/server/docker-compose.yml` sobe so o server com o painel, pensado para uma **stack do Portainer** atras de um **nginx-proxy** (com acme-companion/Let's Encrypt) que voce ja tem rodando. Ele nao publica porta no host: o proxy o alcanca pela rede Docker que os dois compartilham.
+`deploy/server/docker-compose.yml` sobe so o server com o painel, pensado para uma **stack do Portainer em Docker Swarm** atras de um **nginx-proxy** (com acme-companion/Let's Encrypt) que voce ja tem rodando. Ele nao publica porta no host: o proxy o alcanca pela rede overlay externa `proxy_net`, que a stack apenas referencia (`external: true`). O email do Let's Encrypt e o que ja estiver configurado no seu acme-companion.
 
-1. No Portainer: **Stacks > Add stack > Repository**, com a URL do repositorio e o *Compose path* `deploy/server/docker-compose.yml` (o build usa o `Dockerfile` da raiz, alvo `server`).
-2. Em **Environment variables**, cadastre as de `deploy/server/.env.example`:
-   - `DOMAIN`: dominio que ja aponta (DNS) para o servidor do proxy
-   - `LETSENCRYPT_EMAIL`: email do Let's Encrypt
-   - `PROXY_NETWORK`: nome da rede Docker do seu nginx-proxy (**Networks** no Portainer)
-   - `TRUSTED_PROXIES`: faixa (*Subnet*) dessa rede, para o server enxergar o IP real do cliente
+1. A imagem do server fica no repositorio privado `thiagozs/go-rterminal` (veja [Imagem Docker](#imagem-docker)). No Portainer, cadastre as credenciais em **Registries > Add registry > DockerHub** para ele conseguir baixa-la.
+2. **Stacks > Add stack > Web editor** e cole o `deploy/server/docker-compose.yml`. Em **Environment variables**, cadastre as de `deploy/server/.env.example`:
+   - `DOMAIN`: dominio que ja aponta (DNS) para o servidor do proxy (a unica obrigatoria)
+   - `TRUSTED_PROXIES`: faixa (*Subnet*) da rede `proxy_net` (**Networks** no Portainer; padrao `10.0.1.0/24`), para o server enxergar o IP real do cliente
+   - `PLACEMENT_CONSTRAINT`: opcional; o server precisa rodar no mesmo no do nginx-proxy, que le o `docker.sock` local (padrao `node.role == manager`)
+   - `SERVER_IMAGE`: opcional; por padrao `thiagozs/go-rterminal:server` (em producao, fixe uma tag datada)
 3. Faca o deploy. O nginx-proxy detecta `VIRTUAL_HOST`/`LETSENCRYPT_HOST`, emite o certificado e passa a servir `https://DOMAIN/` (WebSockets incluidos, sem configuracao extra: o server envia pings a cada 20s, menos que o timeout padrao de 60s do nginx).
 4. Pegue a senha temporaria em **Stacks > (stack) > server > Logs** (procure `PRIMEIRO ACESSO`) e entre para trocá-la.
 
-O banco fica no volume `rterminal-data` (`/data`), entao sobrevive a atualizacoes da stack. O container roda sem privilegios, com sistema de arquivos somente leitura e sem capabilities. As maquinas usam `wss://DOMAIN` nos comandos gerados.
+O servico roda com uma unica replica, e as atualizacoes param o container antigo antes de subir o novo (`stop-first`), porque o banco e um SQLite em volume local. Ele fica no volume `rterminal-data` (`/data`), entao sobrevive a atualizacoes da stack, mas e local ao no: se o servico for movido para outro no, o banco nao vai junto. O container roda sem privilegios, com sistema de arquivos somente leitura e sem capabilities. As maquinas usam `wss://DOMAIN` nos comandos gerados.
+
+### Imagem Docker
+
+O alvo `server` do `Dockerfile` gera a imagem do server (Debian slim, usuario sem privilegios, banco em `/data`). Para construir e publicar no Docker Hub:
+
+```bash
+make image-server                         # constroi thiagozs/go-rterminal:server, :latest e :server-AAAAMMDD
+docker login
+make push-server                          # envia as tres tags
+```
+
+`IMAGE` e `TAG` podem ser trocados (`make image-server IMAGE=usuario/repo`).
+
+A tag datada (`IMAGE_TAG`, por exemplo `server-20261127`) e gravada como versao no server e nos 5 agents embutidos (`-ldflags -X main.version`). Assim o painel compara a versao de cada agent com a do server e marca **desatualizado** quando diferem.
+
+**Atualizar um ambiente ja no ar:**
+
+1. no Portainer, atualize a stack com "Re-pull image" (a tag `latest` aponta para a build mais recente; para fixar uma versao, use `SERVER_IMAGE=thiagozs/go-rterminal:server-AAAAMMDD`);
+2. no painel, nas maquinas marcadas como **desatualizado**, use **Atualizar agent** e rode o comando mostrado na maquina.
+
+O banco em `/data` e preservado entre atualizacoes.
 
 ## Flags disponiveis
 
@@ -166,6 +211,7 @@ O banco fica no volume `rterminal-data` (`/data`), entao sobrevive a atualizacoe
 - `--db` arquivo SQLite; ativa o painel de administracao e as credenciais por maquina
 - `--public-url` URL publica do server, usada nos comandos gerados (ex: `https://rt.exemplo.com`)
 - `--admin-user` usuario do primeiro administrador (padrao `admin`); a senha inicial e temporaria, gerada e logada uma vez (ou vem de `RTERMINAL_ADMIN_PASSWORD`)
+- `--agents-dir` pasta com os binarios `agent-<os>-<arch>` distribuidos em `/download/agent/` (padrao `$RTERMINAL_AGENTS_DIR`)
 - `--trusted-proxies` CIDRs dos proxies reversos cujo `X-Forwarded-For` e confiavel (ex: `172.16.0.0/12`); sem isso, atras de um proxy todos os logins pareceriam vir do IP do proxy
 - `--tls-cert` caminho do certificado TLS (opcional)
 - `--tls-key` caminho da chave TLS (opcional)

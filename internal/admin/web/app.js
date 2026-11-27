@@ -23,6 +23,8 @@ const MIN_PASSWORD = 8;
 const state = {
   user: null,
   mustChange: false, // temporary password: only the password screen is usable
+  serverVersion: "", // build of this server; agents on another build are flagged
+  downloads: false,  // server ships agent binaries (enables the update command)
   view: "machines", // machines | audit
   groups: [],
   machines: [],
@@ -117,6 +119,8 @@ function loginView() {
       const me = await api("POST", "/api/login", { username: user.value, password: pass.value });
       state.user = me.username;
       state.mustChange = !!me.must_change_password;
+      state.serverVersion = me.server_version || "";
+      state.downloads = !!me.agent_downloads;
       if (!state.mustChange) { await refresh(); startPolling(); }
       render();
     } catch (err) { error.textContent = err.message; }
@@ -253,16 +257,64 @@ function machinesView() {
   return h("div", { class: "content" }, sidebar, main);
 }
 
+// An agent is outdated when it reports a build other than the server's. Builds
+// made without a version ("dev") never compare as outdated.
+function isOutdated(m) {
+  return !!(m.version && state.serverVersion && m.version !== state.serverVersion);
+}
+
+function versionBadge(m) {
+  if (!m.version) return null;
+  return h("div", { class: "muted", title: `agent ${m.version}` },
+    "agent ", h("span", { class: "mono" }, m.version),
+    isOutdated(m) && h("span", { class: "tag warn", title: `O server está em ${state.serverVersion}. Use "Atualizar agent".` }, "desatualizado"));
+}
+
+// updateModal shows the command that downloads the current agent and restarts
+// the service. It reads the credential already stored on the machine, so no
+// secret appears here.
+function updateModal(m) {
+  const base = location.origin;
+  const script = [
+    "# Baixa o agent atual deste server e reinicia o servico (Linux, precisa de sudo e curl)",
+    "TOKEN=$(sudo sed -n 's/^RTERMINAL_TOKEN=//p' /etc/rterminal-agent.env)",
+    'case "$(uname -m)" in',
+    "  x86_64) ARCH=amd64 ;;",
+    "  aarch64|arm64) ARCH=arm64 ;;",
+    "  armv7l|armv6l) ARCH=arm ;;",
+    '  *) echo "arquitetura nao suportada: $(uname -m)" >&2; exit 1 ;;',
+    "esac",
+    `printf 'Authorization: Bearer %s\\n' "$TOKEN" | curl -fsSL -H @- "${base}/download/agent/linux-$ARCH" -o /tmp/rterminal-agent`,
+    "sudo install -m 755 /tmp/rterminal-agent /usr/local/bin/agent.new && sudo mv -f /usr/local/bin/agent.new /usr/local/bin/agent && rm -f /tmp/rterminal-agent",
+    "sudo systemctl restart rterminal-agent",
+    "unset TOKEN ARCH",
+  ].join("\n");
+  const copyBtn = h("button", { class: "btn small" }, "Copiar");
+  copyBtn.addEventListener("click", () => copy(script, copyBtn));
+  const close = modal(
+    h("h2", null, `Atualizar o agent de “${m.name}”`),
+    h("p", { class: "muted" }, m.version
+      ? `Agent atual: ${m.version}. Server: ${state.serverVersion || "—"}.`
+      : "Esta máquina ainda não informou a versão do agent (provavelmente é um agent antigo)."),
+    h("p", { class: "muted" }, "Rode na máquina. Serve para serviços instalados pelo comando do painel (systemd, credencial em /etc/rterminal-agent.env). A credencial não muda."),
+    h("pre", { class: "cmd", tabindex: "0" }, script),
+    h("div", { class: "row" }, copyBtn),
+    h("div", { class: "modal-actions" }, h("button", { class: "btn primary", onclick: () => close() }, "Concluir")),
+  );
+}
+
 function machinesTable(list) {
   const rows = list.map((m) => h("tr", null,
     h("td", null, h("span", { class: "dot" + (m.online ? " on" : ""), title: m.online ? "online" : "offline" }),
       h("strong", null, m.name), h("div", { class: "mono muted" }, m.id)),
     h("td", null, m.group_id != null ? h("span", { class: "tag" }, groupName(m.group_id)) : h("span", { class: "muted" }, "—")),
-    h("td", null, m.hostname ? `${m.hostname}` : "—", h("div", { class: "muted" }, [m.os, m.arch].filter(Boolean).join("/"))),
+    h("td", null, m.hostname ? `${m.hostname}` : "—", h("div", { class: "muted" }, [m.os, m.arch].filter(Boolean).join("/")),
+      versionBadge(m)),
     h("td", { class: "muted" }, m.online ? "online" : timeAgo(m.last_seen)),
     h("td", null, h("div", { class: "actions" },
       h("button", { class: "btn small primary", disabled: !m.online, title: m.online ? "" : "Máquina offline", onclick: () => openTerminal(m) }, "Terminal"),
       h("button", { class: "btn small", onclick: () => machineModal(m) }, "Editar"),
+      state.downloads && m.os === "linux" && h("button", { class: "btn small" + (isOutdated(m) ? " primary" : ""), title: "Comando para atualizar o agent desta máquina, sem trocar a credencial", onclick: () => updateModal(m) }, "Atualizar agent"),
       h("button", { class: "btn small", title: "Gera uma nova credencial e desconecta o agent atual", onclick: () => rotate(m) }, "Nova credencial"),
       h("button", { class: "btn small danger", onclick: () => removeMachine(m) }, "Excluir"),
     )),
@@ -353,10 +405,16 @@ function machineModal(machine) {
 }
 
 function credentialModal(created) {
-  const tabs = [
-    ["Binário", created.commands.binary, "Rode na máquina, com o binário `agent` já instalado:"],
-    ["systemd", created.commands.systemd, "Instala o agent como serviço (Linux). Rode como usuário com sudo:"],
-    ["Instalar o agent", created.commands.go_install, "Compila e instala o binário `agent` (precisa de Go 1.27+). Depois use uma das outras abas:"],
+  const c = created.commands;
+  // With downloads the commands fetch the right agent binary from this server;
+  // otherwise they assume `agent` is already installed on the machine.
+  const tabs = c.downloads ? [
+    ["Linux (systemd)", c.systemd, "Baixa o agent para a arquitetura desta máquina, instala o serviço e inicia. Rode num terminal da máquina (precisa de sudo e curl):"],
+    ["Executar agora", c.binary, "Baixa o agent para ./agent e roda em primeiro plano (Linux ou macOS). Bom para testar:"],
+  ] : [
+    ["Binário", c.binary, "Rode na máquina, com o binário `agent` já instalado:"],
+    ["systemd", c.systemd, "Instala o agent como serviço (Linux). Rode como usuário com sudo; o binário precisa estar em /usr/local/bin/agent:"],
+    ["Instalar o agent", c.go_install || "", "Compila e instala o binário `agent` (precisa de Go 1.27+ e do repositório acessível). Depois use uma das outras abas:"],
   ];
   const pre = h("pre", { class: "cmd", tabindex: "0" });
   const hint = h("p", { class: "muted" });
@@ -397,37 +455,187 @@ async function removeMachine(m) {
 }
 
 // --- terminal ---
+// The browser can only use fonts installed on the computer that is viewing the
+// panel. Prompt themes (Spaceship, Powerlevel10k) and tools like eza print Nerd
+// Font / Font Awesome icons, so the stack tries common Nerd Font names first and
+// ends with a bundled symbols font ("RT Symbols NF") so icons never turn into boxes.
+const TERM_FONT_KEY = "rt.term.font";
+const TERM_SIZE_KEY = "rt.term.size";
+const TERM_RENDERER_KEY = "rt.term.renderer"; // "dom" (default) or "webgl"
+const NERD_FONTS = ["MesloLGS NF", "MesloLGS Nerd Font", "JetBrainsMono Nerd Font", "JetBrainsMono NF",
+  "FiraCode Nerd Font", "Hack Nerd Font", "CaskaydiaCove Nerd Font", "UbuntuMono Nerd Font",
+  "DejaVuSansM Nerd Font", "Symbols Nerd Font Mono"];
+const MONO_FALLBACK = ["ui-monospace", "Menlo", "Consolas", '"DejaVu Sans Mono"', "monospace"];
+
+function store(key, value) {
+  try { if (value === null) localStorage.removeItem(key); else localStorage.setItem(key, value); } catch (_) { /* private mode */ }
+}
+function stored(key) {
+  try { return localStorage.getItem(key) || ""; } catch (_) { return ""; }
+}
+const quoteFont = (name) => {
+  const clean = name.trim().replace(/^["']|["']$/g, "").replace(/["\\]/g, "");
+  return clean ? `"${clean}"` : "";
+};
+function termFontFamily() {
+  const custom = stored(TERM_FONT_KEY).split(",").map(quoteFont).filter(Boolean);
+  return [...custom, ...NERD_FONTS.map(quoteFont), '"RT Symbols NF"', ...MONO_FALLBACK].join(", ");
+}
+function termFontSize() {
+  const n = parseInt(stored(TERM_SIZE_KEY), 10);
+  return n >= 8 && n <= 32 ? n : 14;
+}
+
+// writeClipboard copies text, falling back to execCommand when the async
+// Clipboard API is unavailable (insecure context) or denied.
+async function writeClipboard(text) {
+  try {
+    await navigator.clipboard.writeText(text);
+    return true;
+  } catch (_) {
+    const area = h("textarea", { style: "position:fixed;opacity:0;top:0;left:0" });
+    area.value = text;
+    document.body.append(area);
+    area.select();
+    let ok = false;
+    try { ok = document.execCommand("copy"); } catch (_) { /* not allowed */ }
+    area.remove();
+    return ok;
+  }
+}
+
+// terminalKeyHandler decides which key presses xterm.js must NOT send to the
+// shell, so the browser can copy and paste:
+//   Ctrl/Cmd+C with a selection, or Ctrl+Shift+C  -> copy the selection
+//   Ctrl+C without a selection                    -> goes to the shell (SIGINT)
+//   Ctrl/Cmd+V, Ctrl+Shift+V                      -> browser paste (xterm would send ^V)
+function terminalKeyHandler(term) {
+  return (ev) => {
+    if (ev.type !== "keydown" || !(ev.ctrlKey || ev.metaKey) || ev.altKey) return true;
+    const key = ev.key.toLowerCase();
+    if (key === "c" && (term.hasSelection() || ev.shiftKey)) {
+      const text = term.getSelection();
+      if (text) {
+        writeClipboard(text).then((ok) => ok ? toast("Copiado", "ok") : toast("Não consegui copiar; use o menu do botão direito.", "err"));
+        term.clearSelection();
+      }
+      ev.preventDefault(); // also keeps Chrome from opening DevTools on Ctrl+Shift+C
+      return false;
+    }
+    if (key === "v") return false; // no preventDefault: the browser then pastes into xterm's textarea
+    return true;
+  };
+}
+
+// loadTerminalFonts waits (briefly) for the bundled icon font so xterm measures
+// its character cells with the final fonts.
+function loadTerminalFonts() {
+  const load = document.fonts && document.fonts.load
+    ? document.fonts.load('14px "RT Symbols NF"', "\ue0b0\uf07b").catch(() => {})
+    : Promise.resolve();
+  return Promise.race([load, new Promise((resolve) => setTimeout(resolve, 2000))]);
+}
+
+function fontModal(onChange) {
+  const family = h("input", { id: "f-family", value: stored(TERM_FONT_KEY), placeholder: "ex: MesloLGS NF, JetBrainsMono Nerd Font" });
+  const size = h("input", { id: "f-size", type: "number", min: "8", max: "32", value: String(termFontSize()) });
+  const renderer = h("select", { id: "f-renderer" },
+    h("option", { value: "dom", selected: stored(TERM_RENDERER_KEY) !== "webgl" }, "Padrão (DOM)"),
+    h("option", { value: "webgl", selected: stored(TERM_RENDERER_KEY) === "webgl" }, "WebGL (desenha em canvas; tente se algo aparecer fora do lugar)"));
+  const close = modal(h("form", { onsubmit: (e) => {
+    e.preventDefault();
+    store(TERM_FONT_KEY, family.value.trim() || null);
+    store(TERM_SIZE_KEY, String(Number(size.value) || 14));
+    store(TERM_RENDERER_KEY, renderer.value === "webgl" ? "webgl" : null);
+    onChange();
+    close();
+  } },
+    h("h2", null, "Fonte do terminal"),
+    h("p", { class: "muted" }, "O navegador só enxerga as fontes instaladas neste computador. Informe o nome da sua fonte Nerd Font (a mesma do seu terminal local) para ter ícones e glifos do Powerline idênticos. Sem uma fonte instalada, os ícones usam a fonte de símbolos embutida."),
+    h("label", { for: "f-family" }, "Fonte (nomes separados por vírgula)"), family,
+    h("label", { for: "f-size" }, "Tamanho"), size,
+    h("label", { for: "f-renderer" }, "Renderizador"), renderer,
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", type: "button", onclick: () => { family.value = ""; size.value = "14"; renderer.value = "dom"; } }, "Restaurar padrão"),
+      h("button", { class: "btn", type: "button", onclick: () => close() }, "Cancelar"),
+      h("button", { class: "btn primary", type: "submit" }, "Aplicar")),
+  ));
+}
+
+// escapeBytes renders terminal traffic readably: control characters and
+// private-use (icon) glyphs are shown as escapes so cursor movements are visible.
+function escapeBytes(text) {
+  let out = "";
+  for (const ch of text) {
+    const c = ch.codePointAt(0);
+    if (c === 0x1b) out += "\\e";
+    else if (c === 0x08) out += "\\b";
+    else if (c === 0x0d) out += "\\r";
+    else if (c === 0x0a) out += "\\n";
+    else if (c === 0x09) out += "\\t";
+    else if (c < 0x20 || c === 0x7f) out += "\\x" + c.toString(16).padStart(2, "0");
+    else if ((c >= 0xe000 && c <= 0xf8ff) || c >= 0xf0000 || (c >= 0x2500 && c <= 0x27bf) || c === 0x2026) out += `\\u{${c.toString(16)}}`;
+    else out += ch;
+  }
+  return out;
+}
+
 function openTerminal(machine) {
   const status = h("span", { class: "muted" }, "conectando…");
   const reconnect = h("button", { class: "btn small", hidden: true }, "Reconectar");
   const host = h("div", { id: "term" });
+  let term = null, fit = null, ws = null, ended = false, webgl = null;
+  // Diagnostics: records what the terminal sends and receives (see traceModal).
+  const trace = { on: false, started: 0, lines: [] };
+  const decoder = new TextDecoder("utf-8", { fatal: false });
+  const record = (dir, text) => {
+    if (!trace.on) return;
+    if (trace.lines.length >= 3000) trace.lines.shift();
+    trace.lines.push(`${String(Math.round(performance.now() - trace.started)).padStart(6)}ms ${dir} ${escapeBytes(text)}`);
+  };
   const overlay = h("div", { class: "term-overlay" },
     h("div", { class: "term-bar" },
       h("span", { class: "brand" }, machine.name),
       status, h("span", { class: "spacer" }), reconnect,
+      h("button", { class: "btn small", title: "Grava o que o terminal envia e recebe, para investigar problemas de exibição", onclick: () => traceModal() }, "Diagnóstico"),
+      h("button", { class: "btn small", title: "Fonte e tamanho do terminal", onclick: () => fontModal(applyFont) }, "Fonte"),
       h("button", { class: "btn small", onclick: () => end() }, "Fechar")),
     h("div", { class: "term-host" }, host));
   document.body.append(overlay);
 
-  const term = new Terminal({
-    cursorBlink: true, fontFamily: "ui-monospace, Menlo, Consolas, monospace", fontSize: 14,
-    theme: { background: "#1a1c2c", foreground: "#f4f4f4", cursor: "#ffcd75" },
-  });
-  const fit = new FitAddon.FitAddon();
-  term.loadAddon(fit);
-  term.open(host);
-  fit.fit();
-  term.focus();
-
   const enc = new TextEncoder();
-  let ws = null;
   const sendResize = () => {
     if (ws && ws.readyState === WebSocket.OPEN) ws.send(JSON.stringify({ type: "resize", rows: term.rows, cols: term.cols }));
   };
-  term.onData((d) => { if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d)); });
-  term.onResize(sendResize);
-  const onWindowResize = () => fit.fit();
-  window.addEventListener("resize", onWindowResize);
+  const onWindowResize = () => { if (fit) fit.fit(); };
+  const onEsc = (e) => { if (e.key === "Escape" && e.shiftKey) end(); };
+
+  // setRenderer switches between the DOM renderer and the WebGL (canvas) one.
+  function setRenderer() {
+    const wantWebgl = stored(TERM_RENDERER_KEY) === "webgl" && typeof WebglAddon !== "undefined";
+    if (wantWebgl && !webgl) {
+      try {
+        webgl = new WebglAddon.WebglAddon();
+        webgl.onContextLoss(() => { webgl.dispose(); webgl = null; });
+        term.loadAddon(webgl);
+      } catch (_) {
+        webgl = null;
+        toast("WebGL indisponível neste navegador; usando o renderizador padrão.", "err");
+      }
+    } else if (!wantWebgl && webgl) {
+      webgl.dispose();
+      webgl = null;
+    }
+  }
+
+  function applyFont() {
+    if (!term) return;
+    term.options.fontFamily = termFontFamily();
+    term.options.fontSize = termFontSize();
+    setRenderer();
+    fit.fit();
+    sendResize();
+  }
 
   function connect() {
     reconnect.hidden = true;
@@ -442,7 +650,9 @@ function openTerminal(machine) {
         if (msg.type === "paired") { status.textContent = "conectado"; fit.fit(); sendResize(); }
         return;
       }
-      term.write(new Uint8Array(ev.data));
+      const bytes = new Uint8Array(ev.data);
+      if (trace.on) record("<", decoder.decode(bytes, { stream: true }));
+      term.write(bytes);
     };
     ws.onclose = (ev) => {
       status.textContent = "desconectado";
@@ -451,19 +661,83 @@ function openTerminal(machine) {
     };
     ws.onerror = () => { status.textContent = "erro de conexão"; };
   }
-  reconnect.addEventListener("click", () => { term.clear(); connect(); });
-  const onEsc = (e) => { if (e.key === "Escape" && e.shiftKey) end(); };
-  document.addEventListener("keydown", onEsc);
+
+  function start() {
+    if (ended) return;
+    term = new Terminal({
+      cursorBlink: true, fontFamily: termFontFamily(), fontSize: termFontSize(),
+      theme: { background: "#1a1c2c", foreground: "#f4f4f4", cursor: "#ffcd75" },
+    });
+    fit = new FitAddon.FitAddon();
+    term.loadAddon(fit);
+    term.open(host);
+    term.attachCustomKeyEventHandler(terminalKeyHandler(term));
+    setRenderer();
+    fit.fit();
+    term.focus();
+    term.onData((d) => {
+      record(">", d);
+      if (ws && ws.readyState === WebSocket.OPEN) ws.send(enc.encode(d));
+    });
+    term.onResize(sendResize);
+    window.addEventListener("resize", onWindowResize);
+    document.addEventListener("keydown", onEsc);
+    reconnect.addEventListener("click", () => { term.clear(); connect(); });
+    connect();
+  }
+
+  function traceModal() {
+    const box = h("textarea", { readonly: true, rows: "14", style: "width:100%;font:12px/1.4 var(--mono);white-space:pre;" });
+    // What xterm itself holds in its buffer: compare with what is painted.
+    const bufferSnapshot = () => {
+      if (!term) return "";
+      const b = term.buffer.active;
+      const lines = [];
+      const cursorLine = b.baseY + b.cursorY;
+      for (let y = Math.max(0, cursorLine - 13); y <= cursorLine; y++) {
+        const line = b.getLine(y);
+        const text = line ? line.translateToString(true) : "";
+        if (text.trim()) lines.push(`${String(y).padStart(4)}| ${escapeBytes(text)}`);
+      }
+      return `buffer do xterm (cursor em x=${b.cursorX} y=${b.cursorY + b.baseY}, renderizador ${webgl ? "webgl" : "dom"}):\n` + lines.join("\n");
+    };
+    const info = () => [
+      `terminal: ${term ? term.cols : "?"}x${term ? term.rows : "?"} | dpr ${window.devicePixelRatio} | ${navigator.userAgent}`,
+      `fonte: ${term ? term.options.fontFamily : ""} ${term ? term.options.fontSize : ""}px`,
+      `Legenda: ">" = teclas enviadas, "<" = saida recebida; \\e = ESC, \\b = backspace.`,
+    ].join("\n");
+    const toggle = h("button", { class: "btn primary", type: "button" });
+    const refreshBox = () => {
+      toggle.textContent = trace.on ? "Parar gravação" : "Iniciar gravação";
+      box.value = info() + "\n\n" + bufferSnapshot() + "\n\nfluxo gravado:\n" + trace.lines.join("\n");
+    };
+    toggle.addEventListener("click", () => {
+      trace.on = !trace.on;
+      if (trace.on) { trace.started = performance.now(); trace.lines = []; }
+      refreshBox();
+    });
+    const copyBtn = h("button", { class: "btn", type: "button" }, "Copiar");
+    copyBtn.addEventListener("click", () => copy(box.value, copyBtn));
+    refreshBox();
+    const close = modal(
+      h("h2", null, "Diagnóstico do terminal"),
+      h("p", { class: "muted" }, "1) Clique em Iniciar gravação e feche esta janela. 2) Digite, por exemplo, ls no terminal (sem Enter). 3) Reabra o Diagnóstico, clique em Parar e em Copiar, e envie o texto. Ele contém o que você digitou nesse intervalo: não grave senhas."),
+      box,
+      h("div", { class: "modal-actions" }, copyBtn, toggle, h("button", { class: "btn", type: "button", onclick: () => close() }, "Fechar")),
+    );
+  }
 
   function end() {
+    ended = true;
     window.removeEventListener("resize", onWindowResize);
     document.removeEventListener("keydown", onEsc);
     if (ws) { ws.onclose = null; ws.close(); }
-    term.dispose();
+    if (term) term.dispose();
     overlay.remove();
     refresh().then(render).catch(() => {});
   }
-  connect();
+
+  loadTerminalFonts().then(start);
 }
 
 // --- audit ---
@@ -488,6 +762,8 @@ function auditView() {
     const me = await api("GET", "/api/me");
     state.user = me.username;
     state.mustChange = !!me.must_change_password;
+    state.serverVersion = me.server_version || "";
+    state.downloads = !!me.agent_downloads;
     if (!state.mustChange) { await refresh(); startPolling(); }
   } catch (_) { state.user = null; }
   render();

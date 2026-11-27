@@ -288,6 +288,8 @@ func shellSession(ctx context.Context, config agentConfig, sessionID string, tls
 	defer config.sessionSlots.release()
 
 	command := exec.Command(config.shellPath)
+	command.Env = shellEnvironment(os.Environ(), config.shellPath)
+	command.Dir = startDirectory(command.Env)
 	ptmx, err := pty.Start(command)
 	if err != nil {
 		return fmt.Errorf("iniciar PTY: %w", err)

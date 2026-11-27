@@ -1,40 +1,38 @@
-# go-rterminal: server + painel de administracao, para uma stack do Portainer,
-# atras do nginx-proxy que voce ja tem (HTTPS via Let's Encrypt no proxy).
+# go-rterminal: server + painel de administracao, como stack do Portainer em
+# Docker Swarm, atras do nginx-proxy que voce ja tem (HTTPS via Let's Encrypt).
 #
-# Portainer > Stacks > Add stack > Repository
-#   Repository URL ........ URL do repositorio git do projeto
-#   Compose path .......... deploy/server/docker-compose.yml
-#   Environment variables . as de .env.example (DOMAIN e LETSENCRYPT_EMAIL sao obrigatorias)
-# O build usa o Dockerfile da raiz do repositorio (alvo "server").
+# Portainer > Stacks > Add stack > Web editor (cole este arquivo)
+#   Environment variables . as de .env.example (so DOMAIN e obrigatoria)
+# A imagem vem do Docker Hub (repositorio privado thiagozs/go-rterminal): cadastre
+# antes as credenciais em Portainer > Registries > Add registry > DockerHub.
 #
 # O server nao publica porta no host: so o nginx-proxy o alcanca pela rede
-# Docker compartilhada (PROXY_NETWORK).
+# overlay externa proxy_net.
+#
+# O nginx-proxy descobre os containers pelo docker.sock do PROPRIO no, entao o
+# server precisa rodar no mesmo no que ele. Em Swarm de um no so (ou se o proxy
+# roda no manager) o padrao "node.role == manager" ja atende; senao defina
+# PLACEMENT_CONSTRAINT (ex: node.hostname == meu-no). O volume do banco tambem
+# e local ao no, mais um motivo para fixar o servico em um no.
 #
 # Primeiro acesso: a senha temporaria do admin aparece em Stacks > rterminal >
 # server > Logs (procure por "PRIMEIRO ACESSO") e deve ser trocada no login.
 
 services:
   server:
-    build:
-      context: ../..
-      dockerfile: Dockerfile
-      target: server
-    image: go-rterminal-server:local
-    container_name: rterminal-server
-    restart: unless-stopped
+    image: "${SERVER_IMAGE:-thiagozs/go-rterminal:server}"
     command:
       - "/usr/local/bin/server"
       - "--addr=:8080"
       - "--db=/data/rterminal.db"
       - "--public-url=https://${DOMAIN:?defina a variavel DOMAIN}"
-      # Faixa da rede Docker do proxy: so ela pode informar o IP real (X-Forwarded-For).
-      - "--trusted-proxies=${TRUSTED_PROXIES:-172.16.0.0/12}"
+      # Faixa da rede proxy_net: so ela pode informar o IP real (X-Forwarded-For).
+      - "--trusted-proxies=${TRUSTED_PROXIES:-10.0.1.0/24}"
     environment:
       # Lidas pelo nginx-proxy e pelo acme-companion.
       VIRTUAL_HOST: "${DOMAIN}"
       VIRTUAL_PORT: "8080"
       LETSENCRYPT_HOST: "${DOMAIN}"
-      LETSENCRYPT_EMAIL: "${LETSENCRYPT_EMAIL:?defina a variavel LETSENCRYPT_EMAIL}"
       # Opcional. Vazia = senha temporaria gerada no primeiro start e mostrada
       # nos logs (troca obrigatoria no primeiro login).
       RTERMINAL_ADMIN_PASSWORD: "${RTERMINAL_ADMIN_PASSWORD:-}"
@@ -42,8 +40,10 @@ services:
       - "8080"
     volumes:
       - rterminal-data:/data
+      - type: tmpfs
+        target: /tmp
     networks:
-      - proxy
+      - proxy_net
     healthcheck:
       test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8080/healthz"]
       interval: 30s
@@ -51,18 +51,27 @@ services:
       retries: 3
       start_period: 10s
     read_only: true
-    tmpfs:
-      - /tmp
     cap_drop:
       - ALL
-    security_opt:
-      - "no-new-privileges:true"
+    deploy:
+      # Uma unica replica: o banco e SQLite em volume local.
+      replicas: 1
+      placement:
+        constraints:
+          - "${PLACEMENT_CONSTRAINT:-node.role == manager}"
+      restart_policy:
+        condition: any
+        delay: 5s
+      update_config:
+        # Para o container antigo antes de subir o novo (dois escritores no
+        # mesmo SQLite nao podem coexistir).
+        order: stop-first
+        failure_action: rollback
 
 volumes:
   rterminal-data:
 
 networks:
-  proxy:
-    # Rede em que o seu nginx-proxy ja esta (Portainer > Networks).
-    name: "${PROXY_NETWORK:-nginx-proxy}"
+  # Rede overlay em que o seu nginx-proxy ja esta (Portainer > Networks).
+  proxy_net:
     external: true

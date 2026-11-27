@@ -12,9 +12,14 @@ import (
 // Commands are ready-to-run snippets to enrol a machine. They embed the
 // machine credential, which is shown only once.
 type Commands struct {
-	Binary    string `json:"binary"`
-	Systemd   string `json:"systemd"`
-	GoInstall string `json:"go_install"`
+	// Binary runs the agent in the foreground (Linux/macOS).
+	Binary string `json:"binary"`
+	// Systemd installs the agent as a service (Linux).
+	Systemd string `json:"systemd"`
+	// Downloads is true when the snippets fetch the agent binary from this server.
+	Downloads bool `json:"downloads"`
+	// GoInstall is the fallback when the server ships no binaries.
+	GoInstall string `json:"go_install,omitempty"`
 }
 
 type machineView struct {
@@ -129,41 +134,85 @@ func (s *Server) baseURL(r *http.Request) string {
 	return scheme + "://" + r.Host
 }
 
+// archDetect maps `uname -m` to the arch names of the shipped binaries.
+const archDetect = `case "$(uname -m)" in
+  x86_64) ARCH=amd64 ;;
+  aarch64|arm64) ARCH=arm64 ;;
+  armv7l|armv6l) ARCH=arm ;;
+  *) echo "arquitetura nao suportada: $(uname -m)" >&2; exit 1 ;;
+esac`
+
 func (s *Server) commands(r *http.Request, machineID, credential string) Commands {
-	server := s.baseURL(r)
-	if u, err := url.Parse(server); err == nil {
+	base := s.baseURL(r)
+	wsURL := base
+	if u, err := url.Parse(base); err == nil {
 		switch u.Scheme {
 		case "https":
 			u.Scheme = "wss"
 		case "http":
 			u.Scheme = "ws"
 		}
-		server = u.String()
+		wsURL = u.String()
 	}
-	args := fmt.Sprintf("--server-url %s --agent-id %s", server, machineID)
+	args := fmt.Sprintf("--server-url %s --agent-id %s", wsURL, machineID)
+	unit := strings.Join([]string{
+		"sudo tee /etc/systemd/system/rterminal-agent.service >/dev/null <<'EOF'",
+		"[Unit]",
+		"Description=go-rterminal agent",
+		"After=network-online.target",
+		"Wants=network-online.target",
+		"",
+		"[Service]",
+		"EnvironmentFile=/etc/rterminal-agent.env",
+		"ExecStart=/usr/local/bin/agent " + args,
+		"Restart=always",
+		"RestartSec=5",
+		"",
+		"[Install]",
+		"WantedBy=multi-user.target",
+		"EOF",
+	}, "\n")
+
+	if len(s.agentTargets()) == 0 {
+		// The server ships no binaries: assume `agent` is already installed.
+		return Commands{
+			GoInstall: "go install github.com/thiagozs/go-rterminal/cmd/agent@latest",
+			Binary:    fmt.Sprintf("RTERMINAL_TOKEN=%s agent %s", credential, args),
+			Systemd: strings.Join([]string{
+				"# Guarda a credencial num arquivo legivel so pelo root e cria o servico",
+				"sudo install -m 600 /dev/null /etc/rterminal-agent.env",
+				fmt.Sprintf("echo 'RTERMINAL_TOKEN=%s' | sudo tee /etc/rterminal-agent.env >/dev/null", credential),
+				unit,
+				"sudo systemctl daemon-reload && sudo systemctl enable --now rterminal-agent",
+			}, "\n"),
+		}
+	}
+
+	// The token goes to curl through stdin (-H @-), so it never shows up in `ps`.
+	fetch := func(osExpr, out string) string {
+		return fmt.Sprintf(`printf 'Authorization: Bearer %%s\n' "$TOKEN" | curl -fsSL -H @- "%s/download/agent/%s-$ARCH" -o %s`, base, osExpr, out)
+	}
 	return Commands{
-		GoInstall: "go install github.com/thiagozs/go-rterminal/cmd/agent@latest",
-		Binary:    fmt.Sprintf("RTERMINAL_TOKEN=%s agent %s", credential, args),
+		Downloads: true,
 		Systemd: strings.Join([]string{
-			"# Guarda a credencial num arquivo legivel so pelo root e cria o servico",
+			"# Baixa o agent para esta arquitetura, instala o servico e inicia (Linux)",
+			fmt.Sprintf("TOKEN='%s'", credential),
+			archDetect,
+			fetch("linux", "/tmp/rterminal-agent"),
+			"sudo install -m 755 /tmp/rterminal-agent /usr/local/bin/agent.new && sudo mv -f /usr/local/bin/agent.new /usr/local/bin/agent && rm -f /tmp/rterminal-agent",
 			"sudo install -m 600 /dev/null /etc/rterminal-agent.env",
-			fmt.Sprintf("echo 'RTERMINAL_TOKEN=%s' | sudo tee /etc/rterminal-agent.env >/dev/null", credential),
-			"sudo tee /etc/systemd/system/rterminal-agent.service >/dev/null <<'EOF'",
-			"[Unit]",
-			"Description=go-rterminal agent",
-			"After=network-online.target",
-			"Wants=network-online.target",
-			"",
-			"[Service]",
-			"EnvironmentFile=/etc/rterminal-agent.env",
-			"ExecStart=/usr/local/bin/agent " + args,
-			"Restart=always",
-			"RestartSec=5",
-			"",
-			"[Install]",
-			"WantedBy=multi-user.target",
-			"EOF",
-			"sudo systemctl daemon-reload && sudo systemctl enable --now rterminal-agent",
+			`echo "RTERMINAL_TOKEN=$TOKEN" | sudo tee /etc/rterminal-agent.env >/dev/null`,
+			unit,
+			"sudo systemctl daemon-reload && sudo systemctl enable rterminal-agent && sudo systemctl restart rterminal-agent",
+			"unset TOKEN ARCH",
+		}, "\n"),
+		Binary: strings.Join([]string{
+			"# Baixa o agent para ./agent e roda em primeiro plano (Linux ou macOS)",
+			fmt.Sprintf("TOKEN='%s'", credential),
+			`OS=$(uname -s | tr '[:upper:]' '[:lower:]')`,
+			archDetect,
+			fetch("$OS", "agent") + " && chmod +x agent",
+			fmt.Sprintf(`RTERMINAL_TOKEN="$TOKEN" ./agent %s`, args),
 		}, "\n"),
 	}
 }

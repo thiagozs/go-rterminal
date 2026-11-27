@@ -26,6 +26,10 @@ import (
 
 const envAdminPassword = "RTERMINAL_ADMIN_PASSWORD"
 
+// version is set at build time (-ldflags "-X main.version=..."); agents built
+// from the same image report the same string, so the panel can spot stale ones.
+var version = "dev"
+
 func main() {
 	rootCmd := &cobra.Command{
 		Use:           "server",
@@ -42,6 +46,7 @@ func main() {
 	rootCmd.Flags().String("db", "", "Arquivo SQLite. Ativa o painel de administracao e as credenciais por maquina")
 	rootCmd.Flags().String("public-url", "", "URL publica do server (ex: https://rt.exemplo.com), usada nos comandos gerados")
 	rootCmd.Flags().String("admin-user", "admin", "Usuario do primeiro administrador (criado quando o banco nao tem nenhum)")
+	rootCmd.Flags().String("agents-dir", os.Getenv("RTERMINAL_AGENTS_DIR"), "Pasta com os binarios agent-<os>-<arch> que o server distribui em /download/agent/ (padrao: $RTERMINAL_AGENTS_DIR)")
 	rootCmd.Flags().StringSlice("trusted-proxies", nil, "CIDRs de proxies confiaveis cujo X-Forwarded-For vale (ex: 172.16.0.0/12 para o nginx-proxy em Docker)")
 
 	resetCmd := &cobra.Command{
@@ -65,6 +70,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	dbPath, _ := cmd.Flags().GetString("db")
 	publicURL, _ := cmd.Flags().GetString("public-url")
 	adminUser, _ := cmd.Flags().GetString("admin-user")
+	agentsDir, _ := cmd.Flags().GetString("agents-dir")
 	proxyCIDRs, _ := cmd.Flags().GetStringSlice("trusted-proxies")
 	trustedProxies, err := parseCIDRs(proxyCIDRs)
 	if err != nil {
@@ -126,7 +132,8 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			}
 		}
 		relayServer := relay.New(relayConfig)
-		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies})
+		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version})
+		logAgentDownloads(agentsDir)
 
 		mux := http.NewServeMux()
 		relayHandler := relayServer.Handler()
@@ -188,6 +195,26 @@ func displayURL(addr string, tls bool, publicURL string) string {
 		addr = "localhost" + addr
 	}
 	return scheme + "://" + addr
+}
+
+// logAgentDownloads reports which agent binaries the server will hand out.
+func logAgentDownloads(dir string) {
+	if dir == "" {
+		log.Printf("[server] download do agent desativado (sem --agents-dir); os comandos gerados assumem o agent ja instalado")
+		return
+	}
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		log.Printf("[server] AVISO: --agents-dir %q ilegivel (%v); download do agent desativado", dir, err)
+		return
+	}
+	var names []string
+	for _, entry := range entries {
+		if strings.HasPrefix(entry.Name(), "agent-") {
+			names = append(names, strings.TrimPrefix(entry.Name(), "agent-"))
+		}
+	}
+	log.Printf("[server] download do agent habilitado | %d binarios: %s", len(names), strings.Join(names, " "))
 }
 
 func parseCIDRs(values []string) ([]*net.IPNet, error) {

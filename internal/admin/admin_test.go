@@ -11,7 +11,9 @@ import (
 	"net/http/httptest"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -29,11 +31,12 @@ func TestMain(m *testing.M) {
 }
 
 type env struct {
-	t      *testing.T
-	store  *store.Store
-	relay  *relay.Server
-	srv    *httptest.Server
-	client *http.Client
+	agentsDir string
+	t         *testing.T
+	store     *store.Store
+	relay     *relay.Server
+	srv       *httptest.Server
+	client    *http.Client
 }
 
 func newEnv(t *testing.T, tweaks ...func(*Config)) *env {
@@ -72,7 +75,7 @@ func newEnv(t *testing.T, tweaks ...func(*Config)) *env {
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	jar, _ := cookiejar.New(nil)
-	return &env{t: t, store: st, relay: rl, srv: srv, client: &http.Client{Jar: jar}}
+	return &env{t: t, store: st, relay: rl, srv: srv, client: &http.Client{Jar: jar}, agentsDir: cfg.AgentsDir}
 }
 
 func (e *env) do(method, path string, body any) (int, []byte) {
@@ -539,5 +542,323 @@ func TestHSTSOnlyWithHTTPSPublicURL(t *testing.T) {
 		if got := resp.Header.Get("Strict-Transport-Security") != ""; got != want {
 			t.Errorf("publicURL %q: HSTS present = %v, want %v", url, got, want)
 		}
+	}
+}
+
+func TestLockoutTellsHowLongToWait(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	if _, err := e.store.CreateAdmin("root", "correct-horse", false); err != nil {
+		t.Fatal(err)
+	}
+	for i := 0; i < 5; i++ {
+		e.do("POST", "/api/login", credentials{"root", "wrong"})
+	}
+	raw, _ := json.Marshal(credentials{"root", "correct-horse"})
+	req, _ := http.NewRequest("POST", e.srv.URL+"/api/login", bytes.NewReader(raw))
+	req.Header.Set("X-Requested-With", "rterminal")
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	retry, _ := strconv.Atoi(resp.Header.Get("Retry-After"))
+	if resp.StatusCode != http.StatusTooManyRequests || retry < 1 || retry > 301 ||
+		!strings.Contains(string(body), "try again in 5 minutes") {
+		t.Fatalf("lockout = %d retry-after=%q body=%s", resp.StatusCode, resp.Header.Get("Retry-After"), body)
+	}
+}
+
+// The panel is public: bots guessing "admin" from many addresses must not be
+// able to lock the real administrator out.
+func TestDistributedGuessingDoesNotLockOutTheAdmin(t *testing.T) {
+	t.Parallel()
+	_, localNet, _ := net.ParseCIDR("127.0.0.0/8")
+	e := newEnv(t, func(c *Config) { c.TrustedProxies = []*net.IPNet{localNet} })
+	if _, err := e.store.CreateAdmin("root", "correct-horse", false); err != nil {
+		t.Fatal(err)
+	}
+	attempt := func(ip, pass string) int {
+		raw, _ := json.Marshal(credentials{"root", pass})
+		req, _ := http.NewRequest("POST", e.srv.URL+"/api/login", bytes.NewReader(raw))
+		req.Header.Set("X-Requested-With", "rterminal")
+		req.Header.Set("X-Forwarded-For", ip)
+		resp, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resp.Body.Close()
+		return resp.StatusCode
+	}
+	for i := 0; i < 20; i++ { // 20 bots, one wrong guess each
+		if got := attempt("203.0.113."+strconv.Itoa(i+1), "guess"); got != http.StatusUnauthorized {
+			t.Fatalf("bot %d = %d, want 401", i, got)
+		}
+	}
+	if got := attempt("198.51.100.10", "correct-horse"); got != http.StatusOK {
+		t.Fatalf("real admin locked out by distributed guessing: %d", got)
+	}
+}
+
+func TestLoginLimiterBlockedReportsWait(t *testing.T) {
+	t.Parallel()
+	l := newLoginLimiter(3, time.Minute)
+	if blocked, _ := l.blocked("k"); blocked {
+		t.Fatal("fresh key is blocked")
+	}
+	for i := 0; i < 3; i++ {
+		l.fail("k")
+	}
+	blocked, wait := l.blocked("k")
+	if !blocked || wait <= 0 || wait > time.Minute {
+		t.Fatalf("blocked=%v wait=%v", blocked, wait)
+	}
+	l.reset("k")
+	if blocked, _ := l.blocked("k"); blocked {
+		t.Fatal("reset did not unblock")
+	}
+}
+
+// ---- agent download ----
+
+var fakeAgentTargets = []string{"linux-amd64", "linux-arm64", "linux-arm", "darwin-amd64", "darwin-arm64"}
+
+// newDownloadEnv serves fake agents: tiny shell scripts that echo what they got,
+// so the generated install command can be executed for real.
+func newDownloadEnv(t *testing.T) *env {
+	t.Helper()
+	dir := t.TempDir()
+	for _, target := range fakeAgentTargets {
+		script := "#!/bin/sh\necho \"agent-" + target + " ran with: $* token=$RTERMINAL_TOKEN\"\n"
+		if err := os.WriteFile(filepath.Join(dir, "agent-"+target), []byte(script), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// Files that must never be served.
+	_ = os.WriteFile(filepath.Join(dir, "agent-windows-amd64"), []byte("nope"), 0o644)
+	_ = os.WriteFile(filepath.Join(dir, "notes.txt"), []byte("nope"), 0o644)
+	return newEnv(t, func(c *Config) { c.AgentsDir = dir })
+}
+
+func (e *env) download(target, bearer string, withCookie bool) (int, []byte, http.Header) {
+	e.t.Helper()
+	req, _ := http.NewRequest("GET", e.srv.URL+"/download/agent/"+target, nil)
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	client := http.DefaultClient
+	if withCookie {
+		client = e.client
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		e.t.Fatal(err)
+	}
+	defer resp.Body.Close()
+	data, _ := io.ReadAll(resp.Body)
+	return resp.StatusCode, data, resp.Header
+}
+
+func TestAgentDownloadWithMachineCredential(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	e.login()
+	m := e.createMachine("pi")
+
+	code, body, header := e.download("linux-arm64", m.Credential, false)
+	if code != 200 || !strings.Contains(string(body), "agent-linux-arm64") {
+		t.Fatalf("download = %d %q", code, body)
+	}
+	if header.Get("Content-Type") != "application/octet-stream" || !strings.Contains(header.Get("Content-Disposition"), "attachment") ||
+		header.Get("Cache-Control") != "no-store" {
+		t.Fatalf("headers = %v", header)
+	}
+	_, audit := e.do("GET", "/api/audit", nil)
+	if !strings.Contains(string(audit), "agent_download") || !strings.Contains(string(audit), "machine:pi") {
+		t.Fatalf("audit = %s", audit)
+	}
+}
+
+func TestAgentDownloadRequiresCredentials(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	e.login()
+	m := e.createMachine("pi")
+
+	if code, _, _ := e.download("linux-arm64", "", false); code != http.StatusUnauthorized {
+		t.Fatalf("anonymous = %d, want 401", code)
+	}
+	if code, _, _ := e.download("linux-arm64", "not-a-credential", false); code != http.StatusUnauthorized {
+		t.Fatalf("bad credential = %d, want 401", code)
+	}
+	// The logged-in admin can download from the browser.
+	if code, _, _ := e.download("linux-arm64", "", true); code != 200 {
+		t.Fatalf("admin cookie = %d, want 200", code)
+	}
+	// Rotation revokes the old credential for downloads too.
+	e.do("POST", "/api/machines/pi/rotate", nil)
+	if code, _, _ := e.download("linux-arm64", m.Credential, false); code != http.StatusUnauthorized {
+		t.Fatalf("rotated credential = %d, want 401", code)
+	}
+}
+
+func TestAgentDownloadBadCredentialsAreRateLimited(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	for i := 0; i < 5; i++ {
+		if code, _, _ := e.download("linux-arm64", "guess", false); code != http.StatusUnauthorized {
+			t.Fatalf("guess %d = %d", i, code)
+		}
+	}
+	if code, _, _ := e.download("linux-arm64", "guess", false); code != http.StatusTooManyRequests {
+		t.Fatalf("after 5 bad guesses = %d, want 429", code)
+	}
+}
+
+func TestAgentDownloadTemporaryPasswordAdminIsRefused(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	if _, err := e.store.CreateAdmin("root", "temporary-pass", true); err != nil {
+		t.Fatal(err)
+	}
+	e.do("POST", "/api/login", credentials{"root", "temporary-pass"})
+	if code, _, _ := e.download("linux-arm64", "", true); code != http.StatusUnauthorized {
+		t.Fatalf("temp-password admin = %d, want 401", code)
+	}
+}
+
+func TestAgentDownloadOnlyServesKnownTargets(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	e.login()
+	m := e.createMachine("pi")
+	for _, target := range []string{
+		"windows-amd64",          // file exists but target is not allowed
+		"linux-mips",             // not a shipped arch
+		"..%2f..%2fetc%2fpasswd", // traversal attempts
+		"linux-arm64%2f..%2fx",
+		"%2e%2e",
+		"linux-arm64%00",
+		"darwin-amd64.exe",
+	} {
+		if code, _, _ := e.download(target, m.Credential, false); code != http.StatusNotFound && code != http.StatusBadRequest {
+			t.Errorf("target %q = %d, want 404", target, code)
+		}
+	}
+	// A valid-looking target whose file is absent is a clean 404.
+	if err := os.Remove(filepath.Join(e.srvAgentsDir(), "agent-darwin-arm64")); err != nil {
+		t.Fatal(err)
+	}
+	if code, _, _ := e.download("darwin-arm64", m.Credential, false); code != http.StatusNotFound {
+		t.Errorf("missing binary = %d, want 404", code)
+	}
+}
+
+func (e *env) srvAgentsDir() string { return e.agentsDir }
+
+func TestAgentDownloadDisabledWithoutDirectory(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.login()
+	m := e.createMachine("pi")
+	if code, _, _ := e.download("linux-arm64", m.Credential, false); code != http.StatusNotFound {
+		t.Fatalf("download without --agents-dir = %d, want 404", code)
+	}
+	if m.Commands.Downloads || m.Commands.GoInstall == "" || !strings.Contains(m.Commands.Binary, "RTERMINAL_TOKEN="+m.Credential+" agent") {
+		t.Fatalf("fallback commands = %+v", m.Commands)
+	}
+}
+
+func TestGeneratedCommandsDownloadTheAgent(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	e.login()
+	m := e.createMachine("raspberry5")
+	c := m.Commands
+	if !c.Downloads || c.GoInstall != "" {
+		t.Fatalf("commands = %+v", c)
+	}
+	for _, script := range []string{c.Binary, c.Systemd} {
+		if !strings.Contains(script, "/download/agent/") || !strings.Contains(script, "uname -m") {
+			t.Errorf("script lacks download/arch detection:\n%s", script)
+		}
+		// The credential is assigned once and reaches curl through stdin, never argv.
+		for _, line := range strings.Split(script, "\n") {
+			if strings.Contains(line, "curl") && strings.Contains(line, m.Credential) {
+				t.Errorf("credential on the curl command line (visible in ps): %s", line)
+			}
+		}
+		if strings.Count(script, m.Credential) != 1 {
+			t.Errorf("credential should appear exactly once, got %d", strings.Count(script, m.Credential))
+		}
+	}
+	if !strings.Contains(c.Systemd, "ExecStart=/usr/local/bin/agent --server-url ws://") || !strings.Contains(c.Systemd, "--agent-id raspberry5") ||
+		!strings.Contains(c.Systemd, "systemctl restart rterminal-agent") {
+		t.Errorf("systemd script = %s", c.Systemd)
+	}
+}
+
+// Runs the generated "run now" command under a plain POSIX sh against the real
+// handler: arch detection, authenticated download, chmod and execution.
+func TestGeneratedRunCommandActuallyWorks(t *testing.T) {
+	if _, err := exec.LookPath("curl"); err != nil {
+		t.Skip("curl not installed")
+	}
+	e := newDownloadEnv(t)
+	e.login()
+	m := e.createMachine("raspberry5")
+
+	dir := t.TempDir()
+	cmd := exec.Command("sh", "-c", m.Commands.Binary)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	if err != nil {
+		t.Fatalf("generated command failed: %v\n%s\n--- script ---\n%s", err, out, m.Commands.Binary)
+	}
+	text := string(out)
+	if !strings.Contains(text, "ran with: --server-url ws://") || !strings.Contains(text, "--agent-id raspberry5") ||
+		!strings.Contains(text, "token="+m.Credential) {
+		t.Fatalf("agent did not run with the right arguments/credential:\n%s", text)
+	}
+	if info, err := os.Stat(filepath.Join(dir, "agent")); err != nil || info.Mode().Perm()&0o100 == 0 {
+		t.Fatalf("agent not downloaded executable: %v %v", info, err)
+	}
+	// Downloads are audited under the machine.
+	_, audit := e.do("GET", "/api/audit", nil)
+	if !strings.Contains(string(audit), "machine:raspberry5") {
+		t.Fatalf("audit = %s", audit)
+	}
+
+	// A wrong credential must make the same script fail instead of installing junk.
+	bad := strings.Replace(m.Commands.Binary, m.Credential, "wrong-credential", 1)
+	cmd = exec.Command("sh", "-c", bad)
+	cmd.Dir = t.TempDir()
+	if out, err := cmd.CombinedOutput(); err == nil {
+		t.Fatalf("script with a bad credential succeeded:\n%s", out)
+	}
+}
+
+func TestMeReportsServerVersionAndDownloads(t *testing.T) {
+	t.Parallel()
+	e := newDownloadEnv(t)
+	e.login()
+	_, body := e.do("GET", "/api/me", nil)
+	var me map[string]any
+	if err := json.Unmarshal(body, &me); err != nil {
+		t.Fatal(err)
+	}
+	if me["agent_downloads"] != true {
+		t.Errorf("agent_downloads = %v, want true with an agents dir: %s", me["agent_downloads"], body)
+	}
+	if _, ok := me["server_version"]; !ok {
+		t.Errorf("server_version missing: %s", body)
+	}
+
+	plain := newEnv(t, func(c *Config) { c.Version = "build-42" })
+	plain.login()
+	_, body = plain.do("GET", "/api/me", nil)
+	if !strings.Contains(string(body), `"server_version":"build-42"`) || !strings.Contains(string(body), `"agent_downloads":false`) {
+		t.Errorf("me without agents dir = %s", body)
 	}
 }

@@ -55,8 +55,14 @@ type Config struct {
 	// (e.g. the Docker network of nginx-proxy). Without it the TCP peer address
 	// is the client address, which behind a proxy would be the proxy itself.
 	TrustedProxies []*net.IPNet
-	SessionTTL     time.Duration
-	Logger         *log.Logger
+	// AgentsDir holds agent-<os>-<arch> binaries the server hands out at
+	// /download/agent/<os>-<arch>. Empty disables downloads.
+	AgentsDir string
+	// Version identifies this build; agents reporting a different one are
+	// flagged as outdated in the UI.
+	Version    string
+	SessionTTL time.Duration
+	Logger     *log.Logger
 }
 
 type Server struct {
@@ -64,9 +70,12 @@ type Server struct {
 	relay      Relay
 	publicURL  string
 	trusted    []*net.IPNet
+	agentsDir  string
+	version    string
 	sessionTTL time.Duration
 	logger     *log.Logger
-	limiter    *loginLimiter
+	limiter    *loginLimiter // per client IP (login) and per admin (password change)
+	userLimit  *loginLimiter // per username, deliberately loose: see login
 	upgrader   websocket.Upgrader
 }
 
@@ -84,9 +93,12 @@ func New(config Config) *Server {
 		relay:      config.Relay,
 		publicURL:  strings.TrimRight(config.PublicURL, "/"),
 		trusted:    config.TrustedProxies,
+		agentsDir:  config.AgentsDir,
+		version:    config.Version,
 		sessionTTL: ttl,
 		logger:     logger,
 		limiter:    newLoginLimiter(5, 5*time.Minute),
+		userLimit:  newLoginLimiter(30, 15*time.Minute),
 	}
 	s.upgrader = websocket.Upgrader{CheckOrigin: sameOrigin}
 	return s
@@ -113,6 +125,7 @@ func (s *Server) Handler() http.Handler {
 
 	mux.HandleFunc("GET /api/audit", s.authed(s.listAudit))
 	mux.HandleFunc("GET /ws/terminal", s.terminal)
+	mux.HandleFunc("GET /download/agent/{target}", s.downloadAgent)
 
 	static, _ := fs.Sub(webFS, "web")
 	mux.Handle("GET /", http.FileServer(http.FS(static)))
@@ -304,15 +317,29 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	ip := s.clientIP(r)
-	if !s.limiter.allow(ip) || !s.limiter.allow("user:"+strings.ToLower(in.Username)) {
-		writeError(w, http.StatusTooManyRequests, "too many attempts, try again later")
+	user := strings.ToLower(in.Username)
+	// The per-IP limit is the tight one (5 failures / 5 min). The per-username
+	// limit is loose (30 / 15 min) on purpose: the panel is on the internet and
+	// "admin" is probed constantly, so a tight per-username limit would let any
+	// bot lock the real administrator out.
+	ipBlocked, ipWait := s.limiter.blocked(ip)
+	userBlocked, userWait := s.userLimit.blocked(user)
+	if ipBlocked || userBlocked {
+		wait := ipWait
+		if userWait > wait {
+			wait = userWait
+		}
+		s.logger.Printf("[admin] login bloqueado por excesso de tentativas | ip=%s usuario=%q espera=%s", ip, in.Username, wait.Round(time.Second))
+		w.Header().Set("Retry-After", strconv.Itoa(int(wait.Seconds())+1))
+		writeError(w, http.StatusTooManyRequests, "too many attempts, try again in "+humanWait(wait))
 		return
 	}
 	admin, err := s.store.VerifyAdmin(in.Username, in.Password)
 	if err != nil {
 		if errors.Is(err, store.ErrInvalidCredentials) {
 			s.limiter.fail(ip)
-			s.limiter.fail("user:" + strings.ToLower(in.Username))
+			s.userLimit.fail(user)
+			s.logger.Printf("[admin] login falhou | ip=%s usuario=%q", ip, in.Username)
 			s.audit(in.Username, "login_failed", ip, "")
 			writeError(w, http.StatusUnauthorized, "invalid username or password")
 			return
@@ -321,7 +348,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	s.limiter.reset(ip)
-	s.limiter.reset("user:" + strings.ToLower(in.Username))
+	s.userLimit.reset(user)
 	token, err := s.store.CreateWebSession(admin.ID, s.sessionTTL)
 	if err != nil {
 		s.storeError(w, err)
@@ -334,7 +361,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	})
 	s.audit(admin.Username, "login", ip, "")
 	_ = s.store.PurgeExpiredSessions()
-	writeJSON(w, http.StatusOK, sessionView(admin))
+	writeJSON(w, http.StatusOK, s.sessionView(admin))
 }
 
 func (s *Server) logout(w http.ResponseWriter, r *http.Request, admin *store.Admin) {
@@ -347,12 +374,25 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request, admin *store.Adm
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func sessionView(admin *store.Admin) map[string]any {
-	return map[string]any{"username": admin.Username, "must_change_password": admin.MustChangePassword}
+func (s *Server) sessionView(admin *store.Admin) map[string]any {
+	return map[string]any{
+		"username":             admin.Username,
+		"must_change_password": admin.MustChangePassword,
+		"server_version":       s.version,
+		"agent_downloads":      len(s.agentTargets()) > 0,
+	}
+}
+
+// humanWait renders a wait as "N seconds" or "N minutes", rounding up.
+func humanWait(d time.Duration) string {
+	if d < time.Minute {
+		return strconv.Itoa(int(d.Seconds())+1) + " seconds"
+	}
+	return strconv.Itoa(int((d+time.Minute-1)/time.Minute)) + " minutes"
 }
 
 func (s *Server) me(w http.ResponseWriter, _ *http.Request, admin *store.Admin) {
-	writeJSON(w, http.StatusOK, sessionView(admin))
+	writeJSON(w, http.StatusOK, s.sessionView(admin))
 }
 
 type passwordInput struct {

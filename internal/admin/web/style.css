@@ -1,4 +1,11 @@
 /* Paleta Sweetie-16, a mesma das imagens do README. */
+/* Fallback for Nerd Font / Font Awesome / Powerline icons in the web terminal. */
+@font-face {
+  font-family: "RT Symbols NF";
+  src: url("fonts/SymbolsNerdFontMono.woff2") format("woff2");
+  font-display: block;
+}
+
 :root {
   --ink: #1a1c2c; --plum: #5d275d; --red: #b13e53; --orange: #ef7d57;
   --yellow: #ffcd75; --lime: #a7f070; --green: #38b764; --teal: #257179;
@@ -65,11 +72,12 @@ tr:hover td { background: #20233a; }
 .dot { display: inline-block; width: 10px; height: 10px; border-radius: 50%; background: var(--slate); margin-right: 8px; vertical-align: middle; }
 .dot.on { background: var(--lime); box-shadow: 0 0 0 3px rgba(167, 240, 112, .2); }
 .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; background: var(--navy); font-size: 12px; }
+.tag.warn { background: var(--red); color: var(--white); margin-left: 6px; }
 .actions { display: flex; gap: 6px; justify-content: flex-end; flex-wrap: wrap; }
 .empty { padding: 40px; text-align: center; color: var(--silver); border: 2px dashed var(--slate); border-radius: 6px; }
 
 /* modal */
-.overlay { position: fixed; inset: 0; background: rgba(13, 14, 24, .75); display: grid; place-items: center; padding: 20px; z-index: 10; }
+.overlay { position: fixed; inset: 0; background: rgba(13, 14, 24, .75); display: grid; place-items: center; padding: 20px; z-index: 30; }
 .modal { width: min(720px, 100%); max-height: 92vh; overflow: auto; background: var(--dusk); border: 2px solid var(--slate); border-radius: 6px; padding: 22px; box-shadow: 6px 6px 0 #0d0e18; }
 .modal h2 { margin-bottom: 6px; }
 .modal-actions { display: flex; gap: 8px; justify-content: flex-end; margin-top: 18px; }
