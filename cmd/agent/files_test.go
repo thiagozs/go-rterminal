@@ -348,3 +348,74 @@ func TestFilesStartInTheConfiguredHome(t *testing.T) {
 		t.Fatalf("explicit path = %+v", m)
 	}
 }
+
+func TestFilesPutCreatesTheFolderTree(t *testing.T) {
+	dir := t.TempDir()
+	c := newFileClient(t)
+	target := filepath.Join(dir, "photos", "2026", "trip", "a.txt")
+
+	// Without parents the destination folder must exist.
+	if m := upload(c, target, []byte("x"), false); m.Op != protocol.OpError || !strings.Contains(m.Error, "não existe") {
+		t.Fatalf("without parents = %+v", m)
+	}
+
+	put := func(path string, content []byte, parents bool) protocol.FileMessage {
+		c.send(protocol.FileMessage{Op: protocol.OpPut, Path: path, Size: int64(len(content)), Parents: parents})
+		if m := c.reply(); m.Op != protocol.OpReady {
+			return m
+		}
+		if len(content) > 0 {
+			_ = c.ws.WriteMessage(websocket.BinaryMessage, content)
+		}
+		c.send(protocol.FileMessage{Op: protocol.OpEnd})
+		return c.reply()
+	}
+	if m := put(target, []byte("hello"), true); m.Op != protocol.OpDone {
+		t.Fatalf("with parents = %+v", m)
+	}
+	if got, _ := os.ReadFile(target); string(got) != "hello" {
+		t.Fatalf("content = %q", got)
+	}
+	if st, err := os.Stat(filepath.Join(dir, "photos", "2026")); err != nil || !st.IsDir() || st.Mode().Perm() != 0o755 {
+		t.Fatalf("intermediate folder = %v %v", st, err)
+	}
+	// A second file in the same tree reuses the folders.
+	if m := put(filepath.Join(dir, "photos", "2026", "trip", "b.txt"), nil, true); m.Op != protocol.OpDone {
+		t.Fatalf("second file = %+v", m)
+	}
+	// A path component that is a file is refused, and nothing is left behind.
+	if m := put(filepath.Join(target, "inside.txt"), []byte("x"), true); m.Op != protocol.OpError {
+		t.Fatalf("a file in the middle of the path = %+v, want an error", m)
+	}
+	if left := partFiles(t, filepath.Join(dir, "photos", "2026", "trip")); len(left) != 0 {
+		t.Fatalf("temporary files left: %v", left)
+	}
+}
+
+func TestFilesMkdirParents(t *testing.T) {
+	dir := t.TempDir()
+	c := newFileClient(t)
+	deep := filepath.Join(dir, "a", "b", "c")
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: deep})
+	c.wantError("não existe")
+
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: deep, Parents: true})
+	if m := c.reply(); m.Op != protocol.OpDone {
+		t.Fatalf("mkdir -p = %+v", m)
+	}
+	if st, err := os.Stat(deep); err != nil || !st.IsDir() {
+		t.Fatal("the whole path must exist")
+	}
+	// Like mkdir -p, an existing folder is fine, which makes re-sending a tree safe.
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: deep, Parents: true})
+	if m := c.reply(); m.Op != protocol.OpDone {
+		t.Fatalf("existing folder = %+v", m)
+	}
+	// An existing file is not.
+	file := filepath.Join(dir, "plain")
+	_ = os.WriteFile(file, nil, 0o644)
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: file, Parents: true})
+	c.wantError("não é uma pasta")
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: filepath.Join(file, "sub"), Parents: true})
+	c.wantError("não é uma pasta")
+}

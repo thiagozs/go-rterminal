@@ -224,7 +224,23 @@ func TestFilesRunAsTheChosenUser(t *testing.T) {
 	if m := c.reply(); m.Op != protocol.OpDone {
 		t.Fatalf("mkdir = %+v", m)
 	}
-	for _, p := range []string{target, filepath.Join(home, "newdir")} {
+	// A whole tree: every folder created on the way belongs to the account too.
+	tree := filepath.Join(home, "tree", "sub", "deeper", "file.txt")
+	c.send(protocol.FileMessage{Op: protocol.OpPut, Path: tree, Size: 1, Parents: true})
+	if m := c.reply(); m.Op != protocol.OpReady {
+		t.Fatalf("put with parents = %+v", m)
+	}
+	_ = c.ws.WriteMessage(websocket.BinaryMessage, []byte("x"))
+	c.send(protocol.FileMessage{Op: protocol.OpEnd})
+	if m := c.reply(); m.Op != protocol.OpDone {
+		t.Fatalf("tree upload = %+v", m)
+	}
+	c.send(protocol.FileMessage{Op: protocol.OpPut, Path: "/etc/newtree/file.txt", Size: 1, Parents: true})
+	c.wantError("sem permissão")
+	if _, err := os.Stat("/etc/newtree"); err == nil {
+		t.Fatal("parents created a folder in /etc as root")
+	}
+	for _, p := range []string{target, filepath.Join(home, "newdir"), filepath.Join(home, "tree"), filepath.Join(home, "tree", "sub", "deeper"), tree} {
 		st, err := os.Stat(p)
 		if err != nil {
 			t.Fatal(err)

@@ -7,7 +7,11 @@ package protocol
 //	list  {op:"list", path}                      -> {op:"list", path, entries}
 //	get   {op:"get", path}                       -> {op:"get", path, size}, binary..., {op:"done", bytes}
 //	put   {op:"put", path, size, overwrite}      -> {op:"ready"}; binary...; {op:"end"} -> {op:"done", bytes}
-//	mkdir {op:"mkdir", path}                     -> {op:"done"}
+//	mkdir {op:"mkdir", path, parents}            -> {op:"done"}
+//
+// With parents set, put creates the missing folders of the destination and
+// mkdir creates the whole path and accepts a folder that already exists (like
+// mkdir -p); this is what lets a whole folder tree be uploaded.
 //
 // Any step can be answered with {op:"error", error}.
 const (
@@ -32,6 +36,7 @@ type FileMessage struct {
 	Path      string      `json:"path,omitempty"`
 	Size      int64       `json:"size,omitempty"`
 	Overwrite bool        `json:"overwrite,omitempty"`
+	Parents   bool        `json:"parents,omitempty"`
 	Bytes     int64       `json:"bytes,omitempty"`
 	Entries   []FileEntry `json:"entries,omitempty"`
 	Error     string      `json:"error,omitempty"`

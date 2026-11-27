@@ -159,9 +159,19 @@ a.btn { text-decoration: none; display: inline-block; }
 .files-table td { padding: 5px 10px; }
 .linklike { background: none; border: none; color: var(--sky); cursor: pointer; padding: 0; font: inherit; }
 .linklike:hover { text-decoration: underline; }
-.xfers { max-height: 28vh; overflow: auto; background: var(--dusk); border-top: 2px solid var(--slate); padding: 4px 14px; }
-.xfers:empty { display: none; }
-.xfer { display: grid; grid-template-columns: minmax(120px, 30%) 1fr minmax(120px, 30%); gap: 10px; align-items: center; padding: 3px 0; font-size: 13px; }
+.files-overlay.has-panel .files-body { padding-bottom: 230px; }
+.xfer-panel { position: fixed; left: 50%; transform: translateX(-50%); bottom: 14px; z-index: 28; width: min(780px, calc(100vw - 24px)); display: grid; gap: 8px; padding: 10px 12px; background: var(--dusk); border: 2px solid var(--slate); border-radius: 8px; box-shadow: 6px 6px 0 #0d0e18; }
+.xfer-head { display: flex; align-items: center; gap: 8px; }
+.xfer-title { display: flex; flex-wrap: wrap; align-items: baseline; min-width: 0; }
+.xfer-detail { font-size: 12px; white-space: pre-wrap; }
+.xfer-total { height: 8px; }
+.xfer-list { max-height: 24vh; overflow: auto; display: grid; gap: 2px; }
+.xfer { display: grid; grid-template-columns: minmax(140px, 42%) 1fr minmax(130px, 30%); gap: 10px; align-items: center; padding: 2px 0; font-size: 13px; }
+.xfer-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.xfer-stat { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; text-align: right; font-size: 12px; }
+.xfer-foot { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; }
+.xfer-foot .linklike { margin-left: auto; }
+@media (max-width: 640px) { .xfer { grid-template-columns: 1fr 90px; } .xfer .bar { grid-column: 1 / -1; order: 3; } }
 .bar { height: 8px; background: var(--ink); border-radius: 4px; overflow: hidden; }
 .bar-fill { height: 100%; width: 0; background: var(--sky); transition: width .1s; }
 .bar-fill.ok { background: var(--green); }

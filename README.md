@@ -288,14 +288,19 @@ Botao **Arquivos** na linha da maquina (administradores e operadores com acesso 
 
 - **Navegar**: pastas primeiro, tamanho e data; campo de caminho editavel, botao de pasta acima, recarregar e **Nova pasta**.
 - **Baixar**: botao em cada arquivo; o navegador recebe o arquivo em pedacos de 64 KB e salva no fim.
-- **Enviar**: botao **Enviar arquivos** (varios de uma vez) ou **arrastar e soltar** sobre a tela, sempre para a pasta aberta. Se o arquivo ja existe, o painel pergunta antes de substituir (e a substituicao mantem as permissoes do arquivo original).
-- Cada transferencia mostra uma barra de progresso. Se a conexao cair no meio de um envio, nada fica pela metade: o agent grava num arquivo temporario ao lado e so renomeia quando chegou tudo.
+- **Enviar**: botao **Enviar arquivos** (varios de uma vez), botao **Enviar pasta** ou **arrastar e soltar** arquivos e pastas sobre a tela, sempre para a pasta aberta.
+- **Pastas inteiras**: uma pasta chega com todas as subpastas e arquivos, **com a mesma estrutura da origem** (`Projeto/docs/img/foto.png` vira `<pasta aberta>/Projeto/docs/img/foto.png`). As pastas intermediarias sao criadas no caminho; ao **arrastar**, as pastas **vazias** tambem chegam (o seletor de pasta do navegador nao informa pastas vazias). Pastas e arquivos novos pertencem ao usuario do terminal.
+- **Arquivo que ja existe**: o painel pergunta **Pular**, **Pular todos**, **Substituir** ou **Substituir todos**, o que evita responder 500 vezes ao reenviar uma pasta. A substituicao mantem as permissoes do arquivo original.
+- **Painel de progresso**: fica fixo perto do rodape, para um arquivo ou muitos. Mostra o total (itens, bytes, velocidade e fila), uma barra geral e uma linha por item com o caminho relativo, a barra e o resultado; erros aparecem em laranja. Tem **Cancelar** (interrompe o que esta no ar e descarta o que falta) e a lista pode ser recolhida.
+- **Fechar sozinho ou manualmente**: ao terminar, o painel pode fechar por conta propria depois de alguns segundos (a contagem pausa se voce passar o mouse). Se algum item falhou ou voce cancelou, ele **nunca** fecha sozinho. A opcao fica no rodape do painel e em **Preferencias** (veja abaixo).
+- Se a conexao cair ou voce cancelar no meio de um envio, nada fica pela metade: o agent grava num arquivo temporario ao lado e so renomeia quando chegou tudo.
 
 Como funciona e limites:
 - Tudo trafega por WebSocket (o mesmo canal que o terminal usa), entao nao esbarra no limite de corpo (`client_max_body_size`) do nginx-proxy. O servidor so confere quem pode, audita e aplica o limite de tamanho; o conteudo vai direto do navegador ao agent.
 - O limite (`--max-transfer-mb`, padrao 512 MB) conta os bytes que realmente passaram pelo servidor, nao o tamanho declarado: quem anuncia pouco e manda muito tambem e cortado. O download fica em memoria do navegador ate terminar, entao arquivos muito grandes pesam la.
 - A transferencia roda com as permissoes do **usuario do terminal** da maquina (`--shell-user`; sem ele, as do usuario que roda o agent, que no comando gerado pelo painel sem `--shell-user` e **root**): le e grava o que esse usuario pode, o mesmo alcance do terminal dele, e os arquivos enviados pertencem a ele. A pasta inicial e o home desse usuario.
 - Auditoria: `file_channel` (canal aberto), `file_upload`, `file_download` e `file_mkdir` com o caminho e os bytes, e `file_failed` para o que foi recusado, interrompido ou passou do limite. Listar pastas nao e registrado. Operador fora dos grupos da maquina recebe 404 e fica em `file_denied`.
+- Os itens de uma pasta sao enviados em sequencia, um arquivo por vez: pastas com milhares de arquivos pequenos dependem da latencia ate o servidor.
 - So arquivos comuns sao baixados (nao pastas nem dispositivos). Nao ha exclusao nem renomeacao pelo painel; para isso use o terminal.
 - Exige agent atualizado: agents antigos nao anunciam a funcao e o botao fica desabilitado com a explicacao. Desative por servidor com `--files=false` (`FILE_TRANSFER=false` na stack) ou por maquina com `--no-files` no agent.
 
@@ -313,6 +318,10 @@ O que muda e o que continua igual:
 Para uma maquina que ja usa `User=`: abra **Atualizar agent** (menu ⋯), rode o comando de atualizacao e, em seguida, o comando de **Servico rodando como usuario comum**. Ele tira o `User=`, acrescenta `--shell-user` com o mesmo usuario e reinicia; recusa-se a mexer em um agent que ainda nao tem a flag.
 
 Custo de seguranca: antes, comprometer o agent dava um shell de usuario comum (o `sudo` ainda pedia senha); agora o processo do agent e root, e a protecao passa a depender do codigo dele. Por isso o shell e os arquivos sao rebaixados ao usuario escolhido e so a atualizacao e o download do proprio binario ficam com root. Plataformas sem credenciais por thread (macOS) abrem o terminal como o usuario, mas nao oferecem arquivos com `--shell-user`.
+
+### Preferencias
+
+O botao **Preferencias** na barra superior (todos os usuarios) abre a configuracao do painel. Hoje tem a secao **Transferencia de arquivos**: fechar sozinho o painel de envios ao terminar sem erros (ligado por padrao) e depois de quantos segundos (3, 5, 10 ou 30). As preferencias ficam guardadas **neste navegador** (`localStorage`, chave `rt.prefs`), nao na conta: outro navegador ou computador comeca com os padroes. A fonte e o renderizador do terminal continuam no botao **Fonte** do terminal.
 
 ### Download do agent
 

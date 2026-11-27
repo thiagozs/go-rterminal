@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/gorilla/websocket"
@@ -100,6 +101,10 @@ func friendlyFileError(err error) string {
 		return "sem permissão"
 	case errors.Is(err, os.ErrExist):
 		return "já existe"
+	case errors.Is(err, syscall.ENOTDIR):
+		return "um item do caminho não é uma pasta"
+	case errors.Is(err, syscall.ENOSPC):
+		return "sem espaço em disco"
 	}
 	var pe *os.PathError
 	if errors.As(err, &pe) {
@@ -221,7 +226,14 @@ func serveMkdir(ws *websocket.Conn, m protocol.FileMessage) error {
 	if err != nil {
 		return fileError(ws, err)
 	}
-	if err := os.Mkdir(path, 0o755); err != nil {
+	if m.Parents {
+		if err := os.MkdirAll(path, 0o755); err != nil {
+			if st, statErr := os.Stat(path); statErr == nil && !st.IsDir() {
+				return fileError(ws, errors.New("já existe e não é uma pasta"))
+			}
+			return fileError(ws, err)
+		}
+	} else if err := os.Mkdir(path, 0o755); err != nil {
 		return fileError(ws, err)
 	}
 	return fileReply(ws, protocol.FileMessage{Op: protocol.OpDone, Path: path})
@@ -282,7 +294,14 @@ func servePut(ws *websocket.Conn, m protocol.FileMessage) error {
 	if name == "" || name == "." || name == ".." {
 		return fileError(ws, errors.New("nome de arquivo inválido"))
 	}
-	if st, err := os.Stat(dir); err != nil || !st.IsDir() {
+	if m.Parents {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			if st, statErr := os.Stat(dir); statErr == nil && !st.IsDir() {
+				return fileError(ws, errors.New("um item do caminho já existe e não é uma pasta"))
+			}
+			return fileError(ws, err)
+		}
+	} else if st, err := os.Stat(dir); err != nil || !st.IsDir() {
 		return fileError(ws, errors.New("a pasta de destino não existe"))
 	}
 	mode := os.FileMode(0o644)

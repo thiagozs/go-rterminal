@@ -182,6 +182,7 @@ function shell() {
       h("span", { class: "spacer" }),
       workspace && h("button", { class: "btn small primary", title: "Voltar aos terminais abertos", onclick: () => workspace.show() }, `Terminais (${workspace.count()})`),
       h("span", { class: "muted" }, state.user),
+      h("button", { class: "btn small", title: "Preferências deste navegador", onclick: () => preferencesModal() }, "Preferências"),
       state.twoFAAvailable && h("button", { class: "btn small", title: "Verificação em duas etapas", onclick: () => securityModal() }, "Segurança"),
       h("button", { class: "btn small", onclick: () => passwordModal() }, "Alterar senha"),
       h("button", { class: "btn small", onclick: logout }, "Sair"),
@@ -1523,15 +1524,138 @@ async function watchSession(info) {
   }
 }
 
+// --- preferences (kept in this browser) ---
+const PREFS_KEY = "rt.prefs";
+const PREF_DEFAULTS = {
+  autoCloseTransfers: true, // hide the transfer panel by itself once everything succeeded
+  autoCloseSeconds: 5,      // ...after this many seconds
+};
+const CLOSE_CHOICES = [3, 5, 10, 30];
+
+function prefs() {
+  let saved = {};
+  try { saved = JSON.parse(stored(PREFS_KEY) || "{}") || {}; } catch (_) { /* damaged: use the defaults */ }
+  const out = { ...PREF_DEFAULTS };
+  if (typeof saved.autoCloseTransfers === "boolean") out.autoCloseTransfers = saved.autoCloseTransfers;
+  const secs = Number(saved.autoCloseSeconds);
+  if (Number.isFinite(secs) && secs >= 1 && secs <= 60) out.autoCloseSeconds = Math.round(secs);
+  return out;
+}
+function savePrefs(patch) { store(PREFS_KEY, JSON.stringify({ ...prefs(), ...patch })); }
+
+function preferencesModal() {
+  const p = prefs();
+  const auto = h("input", { type: "checkbox", id: "pf-auto", checked: p.autoCloseTransfers });
+  const choices = CLOSE_CHOICES.includes(p.autoCloseSeconds) ? CLOSE_CHOICES : [...CLOSE_CHOICES, p.autoCloseSeconds].sort((a, b) => a - b);
+  const secs = h("select", { id: "pf-secs", disabled: !p.autoCloseTransfers },
+    ...choices.map((v) => h("option", { value: String(v), selected: v === p.autoCloseSeconds }, `${v} segundos`)));
+  auto.addEventListener("change", () => { secs.disabled = !auto.checked; });
+  const close = modal(
+    h("h2", null, "Preferências"),
+    h("p", { class: "muted" }, "Valem para este navegador e ficam guardadas nele."),
+    h("section", { class: "security" },
+      h("h3", null, "Transferência de arquivos"),
+      h("label", { class: "check", for: "pf-auto" }, auto, "Fechar sozinho o painel de envios quando terminar sem erros"),
+      h("label", { for: "pf-secs" }, "Fechar depois de"), secs,
+      h("p", { class: "muted small-note" }, "Com a opção desligada o painel fica aberto até você fechá-lo. Se algum arquivo falhar, ele nunca fecha sozinho.")),
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", type: "button", onclick: () => close() }, "Cancelar"),
+      h("button", { class: "btn primary", type: "button", onclick: () => {
+        savePrefs({ autoCloseTransfers: auto.checked, autoCloseSeconds: Number(secs.value) });
+        close(); toast("Preferências salvas", "ok");
+      } }, "Salvar")));
+}
+
 // --- file transfer ---
 const FILE_CHUNK = 64 * 1024;
 const joinPath = (dir, name) => (dir === "/" ? "" : dir.replace(/\/+$/, "")) + "/" + name;
 const parentPath = (p) => p.replace(/\/+$/, "").replace(/\/[^/]*$/, "") || "/";
 
+// cleanRel keeps a path chosen in the browser relative and free of "." and "..".
+const cleanRel = (rel) => String(rel).split("/").filter((s) => s && s !== "." && s !== "..").join("/");
+
+// What the user picked or dropped, as { files: [{file, rel}], dirs: [rel] }.
+// rel keeps the folder structure ("Photos/2026/a.jpg"); dirs lists folders,
+// which is the only way an empty folder can be sent.
+async function readAllEntries(reader) {
+  const all = [];
+  for (;;) {
+    const batch = await new Promise((resolve, reject) => reader.readEntries(resolve, reject));
+    if (!batch.length) return all; // readEntries returns a few at a time until it is empty
+    all.push(...batch);
+  }
+}
+async function walkEntry(entry, prefix, out) {
+  if (entry.isFile) {
+    const file = await new Promise((resolve, reject) => entry.file(resolve, reject));
+    out.files.push({ file, rel: cleanRel(prefix + entry.name) });
+  } else if (entry.isDirectory) {
+    const rel = cleanRel(prefix + entry.name);
+    if (rel) out.dirs.push(rel);
+    for (const child of await readAllEntries(entry.createReader())) await walkEntry(child, rel + "/", out);
+  }
+}
+async function collectDropped(dataTransfer) {
+  const out = { files: [], dirs: [] };
+  // webkitGetAsEntry only works while the drop event is being handled, so all
+  // entries are taken before the first await.
+  const entries = [];
+  for (const item of dataTransfer.items || []) {
+    const entry = item.kind === "file" && item.webkitGetAsEntry ? item.webkitGetAsEntry() : null;
+    if (entry) entries.push(entry);
+  }
+  if (!entries.length) {
+    for (const f of dataTransfer.files || []) out.files.push({ file: f, rel: cleanRel(f.name) });
+    return out;
+  }
+  for (const entry of entries) await walkEntry(entry, "", out);
+  out.files = out.files.filter((f) => f.rel);
+  return out;
+}
+function collectPicked(fileList) {
+  const out = { files: [], dirs: [] };
+  for (const f of fileList) {
+    const rel = cleanRel(f.webkitRelativePath || f.name);
+    if (rel) out.files.push({ file: f, rel });
+  }
+  return out;
+}
+// emptyFolders lists the folders that need their own request: the ones that
+// are not an ancestor of another folder or of a file (those get created on the way).
+function emptyFolders(collected) {
+  const ancestors = new Set();
+  const mark = (rel) => {
+    const parts = rel.split("/");
+    for (let i = 1; i < parts.length; i++) ancestors.add(parts.slice(0, i).join("/"));
+  };
+  collected.files.forEach((f) => mark(f.rel));
+  collected.dirs.forEach(mark);
+  return [...new Set(collected.dirs.map(cleanRel).filter(Boolean))].filter((d) => !ancestors.has(d));
+}
+
+// chooseConflict asks what to do with a file that already exists.
+function chooseConflict(path) {
+  return new Promise((resolve) => {
+    const finish = (value) => { overlay.remove(); document.removeEventListener("keydown", onKey, true); resolve(value); };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); finish("skip"); } };
+    const btn = (label, value, cls) => h("button", { class: "btn" + (cls ? " " + cls : ""), type: "button", onclick: () => finish(value) }, label);
+    const overlay = h("div", { class: "overlay" },
+      h("div", { class: "modal", role: "dialog", "aria-modal": "true", style: "width:min(540px,100%)" },
+        h("h2", null, "O arquivo já existe"),
+        h("p", { class: "muted mono", style: "word-break:break-all" }, path),
+        h("p", null, "Substituir o arquivo que está na máquina pelo que você está enviando?"),
+        h("div", { class: "modal-actions", style: "flex-wrap:wrap" },
+          btn("Pular", "skip"), btn("Pular todos", "skipAll"), btn("Substituir", "replace"), btn("Substituir todos", "replaceAll", "primary"))));
+    document.addEventListener("keydown", onKey, true);
+    document.body.append(overlay);
+    overlay.querySelector("button").focus();
+  });
+}
+
 // openFiles shows a file manager for one machine. Browsing, downloads and
 // uploads travel over a WebSocket channel to the agent, one operation at a time.
 function openFiles(machine) {
-  let ws = null, closed = false, cwd = "";
+  let ws = null, cwd = "", closed = false;
   const inbox = [];
   let waiter = null, dead = null;
   const push = (f) => { if (waiter) { const w = waiter; waiter = null; w(f); } else inbox.push(f); };
@@ -1539,6 +1663,7 @@ function openFiles(machine) {
 
   // connect opens the channel and resolves once the agent has joined.
   function connect() {
+    if (closed) return Promise.reject(new Error("tela de arquivos fechada"));
     if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve();
     inbox.length = 0; dead = null;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
@@ -1572,8 +1697,8 @@ function openFiles(machine) {
   // --- layout ---
   const pathInput = h("input", { class: "files-path", "aria-label": "Caminho", spellcheck: "false" });
   const body = h("tbody");
-  const transfers = h("div", { class: "xfers" });
   const picker = h("input", { type: "file", multiple: true, hidden: true });
+  const folderPicker = h("input", { type: "file", multiple: true, webkitdirectory: true, hidden: true });
   const drop = h("div", { class: "files-drop" }, h("table", { class: "files-table" },
     h("thead", null, h("tr", null, ["Nome", "Tamanho", "Modificado", ""].map((x) => h("th", null, x)))), body));
   const overlay = h("div", { class: "player-overlay files-overlay" },
@@ -1587,15 +1712,150 @@ function openFiles(machine) {
         h("button", { class: "btn small", title: "Recarregar", "aria-label": "Recarregar", onclick: () => go(cwd) }, "⟳"),
         pathInput,
         h("button", { class: "btn small", onclick: () => makeFolder() }, "Nova pasta"),
+        h("button", { class: "btn small", title: "Envia uma pasta inteira, com as subpastas e os arquivos, mantendo a estrutura", onclick: () => folderPicker.click() }, "Enviar pasta"),
         h("button", { class: "btn small primary", onclick: () => picker.click() }, "Enviar arquivos"),
-        picker),
-      h("p", { class: "muted files-hint" }, "Arraste arquivos para cá para enviá-los à pasta aberta. Os arquivos enviados pertencem ao usuário do terminal desta máquina. Cada envio e download fica registrado em Auditoria."),
-      drop),
-    transfers);
+        picker, folderPicker),
+      h("p", { class: "muted files-hint" }, "Arraste arquivos ou pastas para cá para enviá-los à pasta aberta; as pastas chegam com todas as subpastas, como na origem. Os arquivos enviados pertencem ao usuário do terminal desta máquina. Cada envio e download fica registrado em Auditoria."),
+      drop));
   document.body.append(overlay);
 
+  // --- transfer panel (docked at the bottom) ---
+  const jobs = [];           // everything of the current batch
+  let cancelled = false, startedAt = 0, conflictPolicy = null, closeTimer = null, collapsed = false, renderQueued = false;
+  const title = h("strong");
+  const detail = h("span", { class: "muted xfer-detail" });
+  const fill = h("div", { class: "bar-fill" });
+  const list = h("div", { class: "xfer-list" });
+  const countdown = h("span", { class: "muted small-note" });
+  const toggleBtn = h("button", { class: "btn small", type: "button", "aria-label": "Mostrar ou esconder a lista", onclick: () => { collapsed = !collapsed; render(); } });
+  const cancelBtn = h("button", { class: "btn small danger", type: "button", onclick: () => cancelAll() }, "Cancelar");
+  const closePanelBtn = h("button", { class: "btn small", type: "button", onclick: () => resetPanel() }, "Fechar");
+  const autoBox = h("input", { type: "checkbox", id: "xfer-auto" });
+  autoBox.addEventListener("change", () => { savePrefs({ autoCloseTransfers: autoBox.checked }); maybeAutoClose(); });
+  const panel = h("section", { class: "xfer-panel", hidden: true, "aria-live": "polite", "aria-label": "Transferências" },
+    h("div", { class: "xfer-head" }, h("div", { class: "xfer-title" }, title, detail), h("span", { class: "spacer" }), toggleBtn, cancelBtn, closePanelBtn),
+    h("div", { class: "bar xfer-total" }, fill),
+    list,
+    h("div", { class: "xfer-foot" },
+      h("label", { class: "check", for: "xfer-auto" }, autoBox, "Fechar sozinho quando terminar"), countdown,
+      h("button", { class: "linklike", type: "button", onclick: () => preferencesModal() }, "Preferências")));
+  overlay.append(panel);
+
+  const counts = () => {
+    const c = { total: jobs.length, finished: 0, ok: 0, err: 0, skipped: 0, cancelled: 0, running: 0, queued: 0, bytes: 0, done: 0 };
+    for (const j of jobs) {
+      c[j.state]++;
+      if (j.state !== "queued" && j.state !== "running") c.finished++;
+      c.bytes += j.size; c.done += j.state === "ok" ? j.size : j.done;
+    }
+    c.active = c.queued + c.running > 0;
+    return c;
+  };
+  const scheduleRender = () => { if (!renderQueued) { renderQueued = true; requestAnimationFrame(() => { renderQueued = false; render(); }); } };
+
+  function render() {
+    overlay.classList.toggle("has-panel", jobs.length > 0);
+    if (!jobs.length) { panel.hidden = true; return; }
+    panel.hidden = false;
+    const c = counts();
+    const uploading = jobs.some((j) => j.kind !== "down");
+    const pct = c.bytes ? c.done / c.bytes : c.finished / c.total;
+    if (c.active) {
+      const secs = Math.max(0.5, (Date.now() - startedAt) / 1000);
+      title.textContent = `${uploading ? "Enviando" : "Baixando"} ${Math.min(c.finished + 1, c.total)} de ${c.total}`;
+      detail.textContent = ` · ${Math.round(pct * 100)}%` + (c.bytes ? ` · ${formatSize(c.done)} de ${formatSize(c.bytes)} · ${formatSize(c.done / secs)}/s` : "") + (c.queued > 0 ? ` · ${c.queued} na fila` : "");
+    } else {
+      title.textContent = c.err ? `Terminou com ${c.err} erro${c.err > 1 ? "s" : ""}` : cancelled ? "Cancelado" : c.total === 1 ? "Concluído" : `${c.ok + c.skipped} itens concluídos`;
+      detail.textContent = " · " + [c.ok && `${c.ok} ok`, c.skipped && `${c.skipped} pulado${c.skipped > 1 ? "s" : ""}`, c.err && `${c.err} com erro`, c.cancelled && `${c.cancelled} cancelado${c.cancelled > 1 ? "s" : ""}`, c.bytes && formatSize(c.bytes)].filter(Boolean).join(" · ");
+    }
+    fill.style.width = `${Math.min(100, pct * 100)}%`;
+    fill.className = "bar-fill" + (!c.active && c.err ? " bad" : !c.active ? " ok" : "");
+    toggleBtn.textContent = collapsed ? "▴" : "▾";
+    list.hidden = collapsed;
+    cancelBtn.hidden = !c.active;
+    closePanelBtn.hidden = c.active;
+    autoBox.checked = prefs().autoCloseTransfers;
+    for (const j of jobs) if (j.row) updateRow(j);
+  }
+
+  const ICON = { up: "↑", down: "↓", dir: "📁" };
+  function updateRow(j) {
+    const text = { queued: "na fila", running: j.size ? `${Math.round((j.done / j.size) * 100)}% · ${formatSize(j.done)} de ${formatSize(j.size)}` : "…", ok: j.kind === "dir" ? "pasta criada" : `${j.kind === "down" ? "baixado" : "enviado"} · ${formatSize(j.size)}`, skipped: j.note, err: j.note, cancelled: "cancelado" }[j.state];
+    j.row.stat.textContent = text;
+    j.row.stat.className = "xfer-stat " + (j.state === "err" ? "error-text" : "muted");
+    j.row.fill.style.width = j.state === "ok" || j.state === "err" ? "100%" : j.size ? `${Math.min(100, (j.done / j.size) * 100)}%` : j.state === "running" ? "30%" : "0";
+    j.row.fill.className = "bar-fill" + (j.state === "ok" ? " ok" : j.state === "err" ? " bad" : "");
+    j.row.el.dataset.state = j.state;
+  }
+  function ensureRow(j) {
+    if (j.row) return;
+    const fillEl = h("div", { class: "bar-fill" });
+    const stat = h("span", { class: "xfer-stat muted" });
+    const el = h("div", { class: "xfer" }, h("span", { class: "xfer-name", title: j.label }, `${ICON[j.kind]} ${j.label}`), h("div", { class: "bar" }, fillEl), stat);
+    j.row = { el, fill: fillEl, stat };
+    list.append(el);
+    list.scrollTop = list.scrollHeight;
+    // Keep the list light on huge folders: drop the oldest rows that succeeded.
+    const done = [...list.children].filter((x) => x.dataset.state === "ok");
+    for (let i = 0; i < done.length - 150; i++) done[i].remove();
+  }
+
+  function pauseAutoClose() { clearInterval(closeTimer); closeTimer = null; countdown.textContent = ""; }
+  function maybeAutoClose() {
+    pauseAutoClose();
+    const c = counts();
+    const p = prefs();
+    if (c.active || !jobs.length || !p.autoCloseTransfers || c.err || cancelled) return;
+    let left = p.autoCloseSeconds;
+    countdown.textContent = `fecha em ${left} s`;
+    closeTimer = setInterval(() => {
+      left--;
+      if (left <= 0) resetPanel(); else countdown.textContent = `fecha em ${left} s`;
+    }, 1000);
+  }
+  panel.addEventListener("mouseenter", pauseAutoClose);
+  panel.addEventListener("mouseleave", maybeAutoClose);
+
+  // resetPanel forgets the finished batch and hides the panel.
+  function resetPanel() {
+    pauseAutoClose();
+    jobs.length = 0; list.replaceChildren();
+    cancelled = false; conflictPolicy = null; collapsed = false;
+    render();
+  }
+  function cancelAll() {
+    cancelled = true;
+    for (const j of jobs) if (j.state === "queued") { j.state = "cancelled"; if (j.row) updateRow(j); }
+    render();
+  }
+  // addJobs starts a new batch, or extends the running one.
+  function addJobs(added) {
+    if (!counts().active) { resetPanel(); startedAt = Date.now(); }
+    pauseAutoClose();
+    jobs.push(...added);
+    render();
+  }
+  function newJob(kind, label, size, run) { return { kind, label, size, done: 0, state: "queued", note: "", row: null, run }; }
+
+  // execute runs one job; it never throws, failures become the job's state.
+  async function execute(j) {
+    if (cancelled) { j.state = "cancelled"; ensureRow(j); updateRow(j); scheduleRender(); return; }
+    j.state = "running"; ensureRow(j); render();
+    try {
+      await connect();
+      await j.run(j);
+      if (j.state === "running") j.state = "ok";
+    } catch (e) {
+      if (e && e.cancelled) j.state = "cancelled";
+      else { j.state = "err"; j.note = e.message || String(e); }
+    }
+    updateRow(j);
+    render();
+    if (!counts().active) maybeAutoClose();
+  }
+
   // --- listing ---
-  async function list(path) {
+  async function list_(path) {
     await connect();
     sendOp({ op: "list", path });
     const f = await next();
@@ -1603,8 +1863,9 @@ function openFiles(machine) {
     return f.msg;
   }
   async function go(path) {
+    if (closed) return;
     try {
-      const r = await serial(() => list(path));
+      const r = await serial(() => list_(path));
       cwd = r.path; pathInput.value = cwd;
       const rows = (r.entries || []).map((e) => {
         const name = e.dir
@@ -1614,7 +1875,7 @@ function openFiles(machine) {
           h("td", null, name, e.link && h("span", { class: "muted", title: "Link simbólico" }, " →")),
           h("td", { class: "muted mono" }, e.dir ? "" : formatSize(e.size)),
           h("td", { class: "muted" }, e.mtime ? new Date(e.mtime * 1000).toLocaleString() : ""),
-          h("td", null, !e.dir && h("button", { class: "btn small", onclick: () => download(joinPath(cwd, e.name), e.name) }, "Baixar")));
+          h("td", null, !e.dir && h("button", { class: "btn small", onclick: () => download(joinPath(cwd, e.name), e.name, e.size) }, "Baixar")));
       });
       body.replaceChildren(...(rows.length ? rows : [h("tr", null, h("td", { colspan: "4", class: "muted" }, "Pasta vazia."))]));
     } catch (e) { toast(`${machine.name}: ${e.message}`, "err"); pathInput.value = cwd; }
@@ -1635,83 +1896,99 @@ function openFiles(machine) {
     } catch (e) { toast(e.message, "err"); }
   }
 
-  // --- transfers ---
-  function transferRow(icon, name) {
-    const bar = h("div", { class: "bar-fill" });
-    const status = h("span", { class: "muted" }, "aguardando…");
-    transfers.prepend(h("div", { class: "xfer" }, h("span", null, `${icon} ${name}`), h("div", { class: "bar" }, bar), status));
-    while (transfers.children.length > 20) transfers.lastChild.remove();
-    return {
-      progress: (done, total) => { bar.style.width = total ? `${Math.min(100, (done / total) * 100)}%` : "100%"; status.textContent = `${formatSize(done)}${total ? " / " + formatSize(total) : ""}`; },
-      ok: (text) => { bar.style.width = "100%"; bar.classList.add("ok"); status.textContent = text; },
-      err: (text) => { bar.classList.add("bad"); status.textContent = text; status.className = "error-text"; },
-    };
-  }
-
-  function download(path, name) {
-    const row = transferRow("↓", name);
-    return serial(async () => {
-      try {
-        await connect();
-        sendOp({ op: "get", path });
-        let f = await next();
-        if (!f.msg || f.msg.op !== "get") fail(f);
-        const total = f.msg.size, parts = [];
-        let got = 0;
-        for (;;) {
-          f = await next();
-          if (f.binary) { parts.push(f.binary); got += f.binary.length; row.progress(got, total); continue; }
-          if (f.msg && f.msg.op === "done") break;
-          fail(f);
-        }
-        if (got !== total) throw new Error(`o arquivo mudou durante o download (${got} de ${total} bytes)`);
-        const url = URL.createObjectURL(new Blob(parts));
-        const a = h("a", { href: url, download: name });
-        document.body.append(a); a.click(); a.remove();
-        setTimeout(() => URL.revokeObjectURL(url), 60000);
-        row.ok(`baixado, ${formatSize(got)}`);
-      } catch (e) { row.err(e.message); }
+  // --- downloads ---
+  function download(path, name, size) {
+    const job = newJob("down", name, size || 0, async (j) => {
+      sendOp({ op: "get", path });
+      let f = await next();
+      if (!f.msg || f.msg.op !== "get") fail(f);
+      const total = f.msg.size, parts = [];
+      j.size = total;
+      for (;;) {
+        f = await next();
+        if (f.binary) { parts.push(f.binary); j.done += f.binary.length; scheduleRender(); continue; }
+        if (f.msg && f.msg.op === "done") break;
+        fail(f);
+      }
+      if (j.done !== total) throw new Error(`o arquivo mudou durante o download (${j.done} de ${total} bytes)`);
+      const url = URL.createObjectURL(new Blob(parts));
+      const a = h("a", { href: url, download: name });
+      document.body.append(a); a.click(); a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 60000);
     });
+    addJobs([job]);
+    serial(() => execute(job));
   }
 
-  function upload(file) {
-    const row = transferRow("↑", file.name);
-    return serial(async () => {
-      try {
-        await connect();
-        const dest = joinPath(cwd, file.name);
-        let overwrite = false;
-        for (;;) {
-          sendOp({ op: "put", path: dest, size: file.size, overwrite });
-          const f = await next();
-          if (f.msg && f.msg.op === "ready") break;
-          if (f.msg && f.msg.op === "error" && /já existe/.test(f.msg.error) && !overwrite && confirm(`${file.name} já existe em ${cwd}. Substituir?`)) { overwrite = true; continue; }
-          fail(f);
-        }
-        for (let off = 0; off < file.size; off += FILE_CHUNK) {
-          if (dead) fail(dead);
-          while (ws.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 25));
-          ws.send(await file.slice(off, off + FILE_CHUNK).arrayBuffer());
-          row.progress(Math.min(off + FILE_CHUNK, file.size), file.size);
-        }
-        sendOp({ op: "end" });
+  // --- uploads (files and whole folders) ---
+  async function putFile(j, file, dest) {
+    let overwrite = conflictPolicy === "replace";
+    for (;;) {
+      sendOp({ op: "put", path: dest, size: file.size, overwrite, parents: true });
+      const f = await next();
+      if (f.msg && f.msg.op === "ready") break;
+      if (f.msg && f.msg.op === "error" && /já existe/.test(f.msg.error) && !overwrite) {
+        let choice = conflictPolicy === "skip" ? "skip" : await chooseConflict(dest);
+        if (choice === "replaceAll") { conflictPolicy = "replace"; choice = "replace"; }
+        if (choice === "skipAll") { conflictPolicy = "skip"; choice = "skip"; }
+        if (choice === "replace") { overwrite = true; continue; }
+        j.state = "skipped"; j.note = "já existe, pulado";
+        return;
+      }
+      fail(f);
+    }
+    for (let off = 0; off < file.size; off += FILE_CHUNK) {
+      if (cancelled) { if (ws) ws.close(); throw { cancelled: true }; } // the agent drops the half-written file
+      if (dead) fail(dead);
+      while (ws.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 25));
+      ws.send(await file.slice(off, off + FILE_CHUNK).arrayBuffer());
+      j.done = Math.min(off + FILE_CHUNK, file.size);
+      scheduleRender();
+    }
+    sendOp({ op: "end" });
+    const f = await next();
+    if (!f.msg || f.msg.op !== "done") fail(f);
+    j.done = file.size;
+  }
+
+  // enqueueUploads sends what was picked or dropped into the open folder,
+  // keeping its structure: folders are created on the way (or, for empty
+  // ones, explicitly) and files go to the same relative path.
+  function enqueueUploads(collected) {
+    const base = cwd;
+    if (!base) { toast("Abra uma pasta antes de enviar.", "err"); return; }
+    const added = [];
+    for (const rel of emptyFolders(collected)) {
+      added.push(newJob("dir", rel + "/", 0, async () => {
+        sendOp({ op: "mkdir", path: joinPath(base, rel), parents: true });
         const f = await next();
         if (!f.msg || f.msg.op !== "done") fail(f);
-        row.ok(`enviado, ${formatSize(file.size)}`);
-        go(cwd);
-      } catch (e) { row.err(e.message); }
-    });
+      }));
+    }
+    for (const { file, rel } of collected.files) {
+      added.push(newJob("up", rel, file.size, (j) => putFile(j, file, joinPath(base, rel))));
+    }
+    if (!added.length) { toast("Nada para enviar.", "err"); return; }
+    addJobs(added);
+    let last = null;
+    for (const j of added) last = serial(() => execute(j));
+    last.then(() => go(cwd));
   }
-  const uploadAll = (files) => { for (const f of files) upload(f); };
-  picker.addEventListener("change", () => { uploadAll([...picker.files]); picker.value = ""; });
+  picker.addEventListener("change", () => { enqueueUploads(collectPicked(picker.files)); picker.value = ""; });
+  folderPicker.addEventListener("change", () => { enqueueUploads(collectPicked(folderPicker.files)); folderPicker.value = ""; });
   for (const ev of ["dragenter", "dragover"]) overlay.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); });
   overlay.addEventListener("dragleave", (e) => { if (e.target === overlay || e.target === drop) drop.classList.remove("over"); });
-  overlay.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); uploadAll([...e.dataTransfer.files]); });
+  overlay.addEventListener("drop", (e) => {
+    e.preventDefault(); drop.classList.remove("over");
+    collectDropped(e.dataTransfer).then(enqueueUploads).catch((err) => toast(`Não consegui ler o que foi solto: ${err.message || err}`, "err"));
+  });
 
   const onKey = (e) => { if (e.key === "Escape" && !document.querySelector(".overlay")) close(); };
   document.addEventListener("keydown", onKey);
   function close() {
-    closed = true;
+    if (counts().active && !confirm("Há transferências em andamento. Fechar agora cancela o que falta. Fechar mesmo?")) return;
+    closed = true; cancelled = true;
+    pauseAutoClose();
     document.removeEventListener("keydown", onKey);
     if (ws) ws.close();
     overlay.remove();
@@ -1728,7 +2005,8 @@ function formatDuration(seconds) {
 function formatSize(bytes) {
   if (bytes < 1024) return `${bytes} B`;
   if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
-  return `${(bytes / 1048576).toFixed(1)} MB`;
+  if (bytes < 1073741824) return `${(bytes / 1048576).toFixed(1)} MB`;
+  return `${(bytes / 1073741824).toFixed(2)} GB`;
 }
 
 function recordingsPanel() {

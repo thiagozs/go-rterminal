@@ -31,7 +31,11 @@ Legenda: `[x]` feito, `[ ]` pendente.
   - [x] Baixar arquivo da máquina
   - [x] Navegar pastas e criar pasta
   - [x] Registrar na auditoria (bytes reais) e limite de tamanho
-  - [ ] Enviar pastas inteiras (arrastar uma pasta)
+  - [x] Enviar pastas inteiras, com subpastas e a mesma estrutura (arrastar ou botão)
+  - [x] Painel de progresso fixo no rodapé, com cancelar e fechar sozinho (opção salva)
+  - [x] Tela de Preferências do painel (guardada no navegador)
+  - [ ] Preferências na conta do usuário (valem em qualquer navegador)
+  - [ ] Enviar vários arquivos em paralelo (pastas com milhares de arquivos pequenos)
   - [ ] Excluir e renomear pelo painel
   - [ ] Baixar vários arquivos / pasta como .zip
   - [ ] Download em streaming para disco (arquivos muito grandes)
