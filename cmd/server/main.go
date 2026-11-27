@@ -20,10 +20,12 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/thiagozs/go-rterminal/internal/admin"
 	"github.com/thiagozs/go-rterminal/internal/auth"
+	"github.com/thiagozs/go-rterminal/internal/mailer"
 	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/recording"
 	"github.com/thiagozs/go-rterminal/internal/relay"
 	"github.com/thiagozs/go-rterminal/internal/store"
+	"github.com/thiagozs/go-rterminal/internal/twofactor"
 )
 
 const envAdminPassword = "RTERMINAL_ADMIN_PASSWORD"
@@ -53,6 +55,17 @@ func main() {
 	rootCmd.Flags().String("recordings-dir", "", "Pasta das gravacoes (padrao: a pasta \"recordings\" ao lado do --db)")
 	rootCmd.Flags().Int("recordings-max-mb", 50, "Tamanho maximo de uma gravacao; a sessao e cortada com um aviso ao passar")
 	rootCmd.Flags().Int("recordings-retention-days", 90, "Apaga gravacoes mais antigas que isso (0 = guarda para sempre)")
+	rootCmd.Flags().String("require-2fa", "none", "Exige verificacao em duas etapas: none, admins ou all (quem nao tem fica so na tela de configuracao)")
+	rootCmd.Flags().String("2fa-issuer", "go-rterminal", "Nome que aparece no app autenticador")
+	rootCmd.Flags().String("resend-api-key", "", "Chave da API do Resend para o PIN por e-mail (prefira RTERMINAL_RESEND_API_KEY, que nao aparece no ps)")
+	rootCmd.Flags().String("mail-from", "", "Remetente dos e-mails, para Resend ou SMTP (ex: \"Painel <painel@exemplo.com>\"; no Resend o dominio precisa estar verificado)")
+	rootCmd.Flags().String("smtp-host", "", "Servidor SMTP para o PIN por e-mail, alternativa ao Resend (sem nenhum dos dois, so o app autenticador fica disponivel)")
+	rootCmd.Flags().Int("smtp-port", 587, "Porta do SMTP")
+	rootCmd.Flags().String("smtp-user", "", "Usuario do SMTP (vazio = sem autenticacao)")
+	rootCmd.Flags().String("smtp-password", "", "Senha do SMTP (prefira RTERMINAL_SMTP_PASSWORD, que nao aparece no ps)")
+	rootCmd.Flags().String("smtp-from", "", "Nome antigo de --mail-from")
+	_ = rootCmd.Flags().MarkHidden("smtp-from")
+	rootCmd.Flags().String("smtp-security", "starttls", "Protecao da conexao SMTP: starttls (587), tls (465) ou none (so relay local)")
 	rootCmd.Flags().StringSlice("trusted-proxies", nil, "CIDRs de proxies confiaveis cujo X-Forwarded-For vale (ex: 172.16.0.0/12 para o nginx-proxy em Docker)")
 
 	resetCmd := &cobra.Command{
@@ -64,6 +77,16 @@ func main() {
 	resetCmd.Flags().String("user", "admin", "Usuario do administrador")
 	_ = resetCmd.MarkFlagRequired("db")
 	rootCmd.AddCommand(resetCmd)
+
+	reset2FACmd := &cobra.Command{
+		Use:   "reset-2fa",
+		Short: "Remove a verificacao em duas etapas de um usuario (recuperacao de acesso)",
+		RunE:  runReset2FA,
+	}
+	reset2FACmd.Flags().String("db", "", "Arquivo SQLite do server")
+	reset2FACmd.Flags().String("user", "admin", "Usuario que perdeu o segundo fator")
+	_ = reset2FACmd.MarkFlagRequired("db")
+	rootCmd.AddCommand(reset2FACmd)
 	cobra.CheckErr(rootCmd.Execute())
 }
 
@@ -84,6 +107,15 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	retentionDays, _ := cmd.Flags().GetInt("recordings-retention-days")
 	if recordingsMaxMB < 1 || retentionDays < 0 {
 		return fmt.Errorf("recordings-max-mb deve ser >= 1 e recordings-retention-days >= 0")
+	}
+	require2FA, _ := cmd.Flags().GetString("require-2fa")
+	issuer, _ := cmd.Flags().GetString("2fa-issuer")
+	if require2FA != "none" && require2FA != "admins" && require2FA != "all" {
+		return fmt.Errorf("require-2fa deve ser none, admins ou all")
+	}
+	mailSender, mailProvider, err := mailFromFlags(cmd)
+	if err != nil {
+		return err
 	}
 	trustedProxies, err := parseCIDRs(proxyCIDRs)
 	if err != nil {
@@ -144,6 +176,16 @@ func runServer(cmd *cobra.Command, _ []string) error {
 				log.Printf("[server] falha ao registrar conexão | agent=%s err=%v", id, err)
 			}
 		}
+		sealer, err := twofactor.LoadSealer(filepath.Join(filepath.Dir(dbPath), "2fa.key"))
+		if err != nil {
+			return err
+		}
+		if require2FA != "none" {
+			log.Printf("[server] verificação em duas etapas obrigatória para: %s", map[string]string{"admins": "administradores", "all": "todos os usuários"}[require2FA])
+		}
+		if mailSender != nil {
+			log.Printf("[server] PIN por e-mail disponível (%s)", mailProvider)
+		}
 		var recordings *recording.Manager
 		if recordSessions {
 			if recordingsDir == "" {
@@ -162,7 +204,8 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			log.Printf("[server] gravação de sessões desativada")
 		}
 		relayServer := relay.New(relayConfig)
-		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version, Recordings: recordings})
+		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version, Recordings: recordings,
+			Sealer: sealer, Mailer: mailSender, Require2FA: require2FA, Issuer: issuer})
 		logAgentDownloads(agentsDir)
 
 		mux := http.NewServeMux()
@@ -340,6 +383,70 @@ func bootstrapAdmin(st *store.Store, username string) error {
 	} else {
 		log.Printf("[server] primeiro administrador criado | usuario=%s (senha de %s)", username, envAdminPassword)
 	}
+	return nil
+}
+
+// mailFromFlags builds the e-mail sender and describes it for the log. It
+// returns a nil sender (and no error) when no provider was configured: a typed
+// nil would not be a nil interface, hence the helper.
+func mailFromFlags(cmd *cobra.Command) (admin.Mailer, string, error) {
+	host, _ := cmd.Flags().GetString("smtp-host")
+	apiKey, _ := cmd.Flags().GetString("resend-api-key")
+	if apiKey == "" {
+		apiKey = os.Getenv("RTERMINAL_RESEND_API_KEY")
+	}
+	from, _ := cmd.Flags().GetString("mail-from")
+	if from == "" {
+		from, _ = cmd.Flags().GetString("smtp-from") // older name of the same setting
+	}
+	switch {
+	case apiKey != "" && host != "":
+		return nil, "", fmt.Errorf("escolha um provedor de e-mail: Resend (--resend-api-key) ou SMTP (--smtp-host), não os dois")
+	case apiKey != "":
+		m, err := mailer.NewResend(mailer.ResendConfig{APIKey: apiKey, From: from})
+		if err != nil {
+			return nil, "", err
+		}
+		return m, "Resend", nil
+	case host != "":
+		port, _ := cmd.Flags().GetInt("smtp-port")
+		user, _ := cmd.Flags().GetString("smtp-user")
+		password, _ := cmd.Flags().GetString("smtp-password")
+		if password == "" {
+			password = os.Getenv("RTERMINAL_SMTP_PASSWORD")
+		}
+		security, _ := cmd.Flags().GetString("smtp-security")
+		m, err := mailer.New(mailer.Config{Host: host, Port: port, Username: user, Password: password, From: from, Security: security})
+		if err != nil {
+			return nil, "", err
+		}
+		return m, fmt.Sprintf("SMTP %s:%d", host, port), nil
+	}
+	return nil, "", nil
+}
+
+func runReset2FA(cmd *cobra.Command, _ []string) error {
+	dbPath, _ := cmd.Flags().GetString("db")
+	user, _ := cmd.Flags().GetString("user")
+	if _, err := os.Stat(dbPath); err != nil {
+		return fmt.Errorf("banco não encontrado: %s", dbPath)
+	}
+	st, err := store.Open(dbPath)
+	if err != nil {
+		return err
+	}
+	defer st.Close()
+	account, err := st.UserByName(user)
+	if err != nil {
+		if errors.Is(err, store.ErrNotFound) {
+			return fmt.Errorf("usuário %q não existe", user)
+		}
+		return err
+	}
+	if err := st.ClearTwoFactor(account.ID); err != nil {
+		return err
+	}
+	fmt.Printf("Verificação em duas etapas de %q removida e sessões encerradas. Ela entra só com a senha e pode configurar de novo.\n", user)
 	return nil
 }
 

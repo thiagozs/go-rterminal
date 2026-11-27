@@ -35,7 +35,19 @@ CREATE TABLE IF NOT EXISTS admins (
 	password_hash TEXT NOT NULL,
 	created_at INTEGER NOT NULL,
 	must_change_password INTEGER NOT NULL DEFAULT 0,
-	role TEXT NOT NULL DEFAULT 'admin'
+	role TEXT NOT NULL DEFAULT 'admin',
+	email TEXT NOT NULL DEFAULT '',
+	totp_secret TEXT NOT NULL DEFAULT '',
+	totp_pending TEXT NOT NULL DEFAULT '',
+	totp_enabled INTEGER NOT NULL DEFAULT 0,
+	totp_last_step INTEGER NOT NULL DEFAULT 0,
+	email_2fa INTEGER NOT NULL DEFAULT 0
+);
+CREATE TABLE IF NOT EXISTS recovery_codes (
+	user_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+	code_hash TEXT NOT NULL,
+	used INTEGER NOT NULL DEFAULT 0,
+	PRIMARY KEY (user_id, code_hash)
 );
 CREATE TABLE IF NOT EXISTS user_groups (
 	user_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
@@ -115,7 +127,18 @@ func migrate(db *sql.DB) error {
 		return err
 	}
 	// Accounts created before roles existed are administrators.
-	return addColumnIfMissing(db, "admins", "role", "TEXT NOT NULL DEFAULT 'admin'")
+	if err := addColumnIfMissing(db, "admins", "role", "TEXT NOT NULL DEFAULT 'admin'"); err != nil {
+		return err
+	}
+	for column, definition := range map[string]string{
+		"email": "TEXT NOT NULL DEFAULT ''", "totp_secret": "TEXT NOT NULL DEFAULT ''", "totp_pending": "TEXT NOT NULL DEFAULT ''",
+		"totp_enabled": "INTEGER NOT NULL DEFAULT 0", "totp_last_step": "INTEGER NOT NULL DEFAULT 0", "email_2fa": "INTEGER NOT NULL DEFAULT 0",
+	} {
+		if err := addColumnIfMissing(db, "admins", column, definition); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func addColumnIfMissing(db *sql.DB, table, column, definition string) error {

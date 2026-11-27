@@ -118,6 +118,19 @@ pre.cmd { margin: 0; background: #0d0e18; border: 1px solid var(--slate); border
 .player-controls .pick { width: auto; padding: 4px 8px; }
 a.btn { text-decoration: none; display: inline-block; }
 
+/* seguranca / 2fa */
+.login .tabs { gap: 3px; margin-top: 10px; }
+.login .tabs button { flex: 1 1 0; min-width: 0; padding: 6px 4px; font-size: 12px; }
+.login form > .btn[type=button]:not(.primary) { margin-top: 10px; }
+.login .setup { width: min(520px, 100%); background: var(--dusk); border: 2px solid var(--slate); border-radius: 6px; padding: 24px; box-shadow: 6px 6px 0 #0d0e18; }
+.login .setup form { width: auto; background: none; border: 0; padding: 0; box-shadow: none; }
+.security section { border-top: 1px solid var(--dusk); padding: 10px 0; }
+.security h3 { margin: 0 0 6px; font-size: 14px; color: var(--silver); text-transform: uppercase; letter-spacing: .05em; }
+.qr { display: block; background: #fff; padding: 8px; border-radius: 4px; margin: 8px 0; }
+.codes { columns: 2; column-gap: 24px; user-select: all; }
+.tag.ok { background: var(--green); color: var(--ink); }
+#tf-code, #totp-code, #email-code { font-family: var(--mono); font-size: 18px; letter-spacing: .15em; }
+
 /* usuarios */
 .checks { display: grid; gap: 4px; max-height: 200px; overflow: auto; padding: 4px 0; }
 .check { display: flex; align-items: center; gap: 8px; margin: 0; text-transform: none; letter-spacing: 0; font-size: 14px; color: var(--white); cursor: pointer; }

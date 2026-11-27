@@ -24,6 +24,9 @@ const state = {
   user: null,
   role: "admin",     // admin (everything) | operator (terminals of their groups only)
   mustChange: false, // temporary password: only the password screen is usable
+  mustSetup2FA: false, // policy requires a second factor the account does not have yet
+  twoFAAvailable: false, // the server can do two-factor authentication
+  pending2FA: null,  // {challenge, methods, hint} between the password and the second factor
   serverVersion: "", // build of this server; agents on another build are flagged
   downloads: false,  // server ships agent binaries (enables the update command)
   recording: false,  // server records web terminal sessions (audit > recorded sessions)
@@ -50,8 +53,10 @@ async function api(method, path, body) {
   let data = null;
   try { data = await resp.json(); } catch (_) { /* no body */ }
   if (!resp.ok) {
-    if (resp.status === 401 && path !== "/api/login" && path !== "/api/password") { state.user = null; render(); }
+    // Only an expired session logs out; a wrong code or password is a 401 too and must stay on the screen.
+    if (resp.status === 401 && data && data.error === "login required") { state.user = null; state.pending2FA = null; render(); }
     if (resp.status === 403 && data && data.error === "password change required") { state.mustChange = true; render(); }
+    if (resp.status === 403 && data && data.error === "two-factor setup required") { state.mustSetup2FA = true; render(); }
     throw new APIError(resp.status, (data && data.error) || resp.statusText);
   }
   return data;
@@ -95,6 +100,25 @@ async function refresh() {
   state.machines = machines;
 }
 
+// applyMe copies the session view from /api/me or a finished login into state.
+function applyMe(me) {
+  state.user = me.username;
+  state.role = me.role || "admin";
+  state.mustChange = !!me.must_change_password;
+  state.mustSetup2FA = !!me.must_setup_2fa;
+  state.twoFAAvailable = !!me.two_factor_available;
+  state.serverVersion = me.server_version || "";
+  state.downloads = !!me.agent_downloads;
+  state.recording = !!me.recording;
+}
+const sessionReady = () => !state.mustChange && !state.mustSetup2FA;
+
+// enterPanel loads the data and shows the panel once nothing is pending.
+async function enterPanel() {
+  if (sessionReady()) { await refresh(); startPolling(); }
+  render();
+}
+
 function startPolling() {
   stopPolling();
   state.timer = setInterval(async () => {
@@ -107,8 +131,9 @@ function stopPolling() { clearInterval(state.timer); state.timer = null; }
 // ---------- views ----------
 function render() {
   const app = document.getElementById("app");
-  if (!state.user) app.replaceChildren(loginView());
+  if (!state.user) app.replaceChildren(state.pending2FA ? twoFactorLoginView() : loginView());
   else if (state.mustChange) app.replaceChildren(forcedPasswordView());
+  else if (state.mustSetup2FA) app.replaceChildren(forcedSetupView());
   else { app.replaceChildren(shell()); openPopupIfRequested(); }
 }
 
@@ -121,15 +146,14 @@ function loginView() {
     error.textContent = "";
     try {
       const me = await api("POST", "/api/login", { username: user.value, password: pass.value });
-      state.user = me.username;
-      state.role = me.role || "admin";
+      if (me.two_factor) {
+        state.pending2FA = { challenge: me.challenge, methods: me.methods, hint: me.email_hint };
+        render();
+        return;
+      }
+      applyMe(me);
       state.view = "machines";
-      state.mustChange = !!me.must_change_password;
-      state.serverVersion = me.server_version || "";
-      state.downloads = !!me.agent_downloads;
-      state.recording = !!me.recording;
-      if (!state.mustChange) { await refresh(); startPolling(); }
-      render();
+      await enterPanel();
     } catch (err) { error.textContent = err.message; }
   } },
     h("div", { class: "brand" }, "GO-RTERMINAL"),
@@ -154,6 +178,7 @@ function shell() {
       h("span", { class: "spacer" }),
       workspace && h("button", { class: "btn small primary", title: "Voltar aos terminais abertos", onclick: () => workspace.show() }, `Terminais (${workspace.count()})`),
       h("span", { class: "muted" }, state.user),
+      state.twoFAAvailable && h("button", { class: "btn small", title: "Verificação em duas etapas", onclick: () => securityModal() }, "Segurança"),
       h("button", { class: "btn small", onclick: () => passwordModal() }, "Alterar senha"),
       h("button", { class: "btn small", onclick: logout }, "Sair"),
     ),
@@ -188,11 +213,9 @@ function passwordForm(onDone, extra) {
 
 function forcedPasswordView() {
   const { form } = passwordForm(async () => {
-    state.mustChange = false;
-    await refresh();
-    startPolling();
-    render();
-    toast("Senha alterada. Bem-vindo!", "ok");
+    try { applyMe(await api("GET", "/api/me")); } catch (_) { state.mustChange = false; }
+    await enterPanel();
+    toast("Senha alterada.", "ok");
   }, [
     h("div", { class: "brand" }, "GO-RTERMINAL"),
     h("h2", null, "Defina uma nova senha"),
@@ -219,6 +242,8 @@ async function logout() {
   stopPolling();
   state.user = null;
   state.mustChange = false;
+  state.mustSetup2FA = false;
+  state.pending2FA = null;
   render();
 }
 
@@ -917,6 +942,233 @@ function createWorkspace(popup) {
   return ws_;
 }
 
+// --- two-factor authentication ---
+const METHOD_LABEL = { totp: "App autenticador", email: "Código por e-mail", recovery: "Código de recuperação" };
+
+// twoFactorLoginView is the step after a correct password.
+function twoFactorLoginView() {
+  const p = state.pending2FA;
+  const modes = [...p.methods, "recovery"];
+  let mode = modes[0];
+  const error = h("p", { class: "error", role: "alert" });
+  const info = h("p", { class: "muted" });
+  const code = h("input", { id: "tf-code", autocomplete: "one-time-code", inputmode: "text", required: true, autofocus: true, maxlength: "14" });
+  const sendBtn = h("button", { class: "btn", type: "button" }, "Enviar código por e-mail");
+  const tabs = h("div", { class: "tabs", role: "tablist" });
+  const back = () => { state.pending2FA = null; render(); };
+  const hints = {
+    totp: "Digite o código de 6 dígitos que aparece no app autenticador.",
+    email: `Pedimos um código por e-mail${p.hint ? " para " + p.hint : ""}. Ele vale poucos minutos.`,
+    recovery: "Use um dos códigos de recuperação que você guardou. Cada um só funciona uma vez.",
+  };
+  const sendPIN = async () => {
+    error.textContent = "";
+    try {
+      const out = await api("POST", "/api/login/2fa/send", { challenge: p.challenge });
+      info.textContent = `Código enviado para ${out.email_hint}. Confira a caixa de entrada e o spam.`;
+      code.focus();
+    } catch (e) { error.textContent = e.message; }
+  };
+  sendBtn.addEventListener("click", sendPIN);
+  const show = (m) => {
+    mode = m;
+    error.textContent = "";
+    info.textContent = hints[m];
+    sendBtn.hidden = m !== "email";
+    code.value = "";
+    code.placeholder = m === "recovery" ? "xxxxx-xxxxx" : "000000";
+    [...tabs.children].forEach((b, i) => b.classList.toggle("active", modes[i] === m));
+  };
+  modes.forEach((m) => tabs.append(h("button", { type: "button", role: "tab", onclick: () => show(m) }, METHOD_LABEL[m])));
+  const form = h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    error.textContent = "";
+    try {
+      const me = await api("POST", "/api/login/2fa/verify", { challenge: p.challenge, method: mode, code: code.value });
+      state.pending2FA = null;
+      applyMe(me);
+      state.view = "machines";
+      await enterPanel();
+    } catch (err) {
+      if (err.status === 401 && /log in again|expired|start again/.test(err.message)) { state.pending2FA = null; render(); toast("Login expirado. Entre de novo.", "err"); return; }
+      error.textContent = err.message;
+      code.select();
+    }
+  } },
+    h("div", { class: "brand" }, "GO-RTERMINAL"),
+    h("h2", null, "Verificação em duas etapas"),
+    tabs, info,
+    h("label", { for: "tf-code" }, "Código"), code,
+    sendBtn,
+    error,
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", type: "button", onclick: back }, "Voltar"),
+      h("button", { class: "btn primary", type: "submit" }, "Entrar")));
+  show(mode);
+  if (mode === "email") sendPIN(); // e-mail is the only method: send right away
+  return h("div", { class: "login" }, form);
+}
+
+// askPassword asks for the current password; resolves to it, or null if cancelled.
+function askPassword(title, explanation) {
+  return new Promise((resolve) => {
+    const pass = h("input", { id: "ask-pass", type: "password", autocomplete: "current-password", required: true });
+    let answered = false;
+    const done = (value) => { answered = true; close(); resolve(value); };
+    const close = modal(h("form", { onsubmit: (e) => { e.preventDefault(); done(pass.value); } },
+      h("h2", null, title), h("p", { class: "muted" }, explanation),
+      h("label", { for: "ask-pass" }, "Sua senha"), pass,
+      h("div", { class: "modal-actions" },
+        h("button", { class: "btn", type: "button", onclick: () => done(null) }, "Cancelar"),
+        h("button", { class: "btn primary", type: "submit" }, "Confirmar"))));
+    // Escape or a click outside also closes the modal: treat as cancel.
+    const watch = setInterval(() => { if (!answered && !document.body.contains(pass)) { clearInterval(watch); answered = true; resolve(null); } }, 200);
+  });
+}
+
+// securityPanel manages the account's second factors. onChanged runs after a
+// change has been saved and the person is done with the recovery codes.
+function securityPanel(onChanged) {
+  const box = h("div", { class: "security" });
+  const fail2 = (e) => toast(e.message || String(e), "err");
+
+  async function reload() {
+    let st;
+    try { st = await api("GET", "/api/2fa"); } catch (e) { box.replaceChildren(h("p", { class: "error" }, e.message)); return; }
+    draw(st);
+  }
+  async function changed(codes) {
+    if (codes && codes.length) { showCodes(codes); return; }
+    await onChanged();
+    reload();
+  }
+  function showCodes(codes) {
+    const text = codes.join("\n");
+    const copyBtn = h("button", { class: "btn small" }, "Copiar");
+    copyBtn.addEventListener("click", () => copy(text, copyBtn));
+    const saveBtn = h("button", { class: "btn small" }, "Baixar .txt");
+    saveBtn.addEventListener("click", () => {
+      const a = h("a", { href: URL.createObjectURL(new Blob([`Códigos de recuperação (${state.user})\n\n${text}\n`], { type: "text/plain" })), download: "codigos-de-recuperacao.txt" });
+      document.body.append(a); a.click(); a.remove();
+    });
+    box.replaceChildren(
+      h("h3", null, "Códigos de recuperação"),
+      h("div", { class: "warn" }, "Guarde estes códigos num lugar seguro (um gerenciador de senhas, por exemplo). Cada um entra uma vez se você perder o celular ou o acesso ao e-mail. Eles não serão mostrados de novo."),
+      h("pre", { class: "cmd codes", tabindex: "0" }, text),
+      h("div", { class: "row" }, copyBtn, saveBtn),
+      h("div", { class: "modal-actions" }, h("button", { class: "btn primary", onclick: async () => { await onChanged(); reload(); } }, "Guardei os códigos")));
+  }
+
+  function draw(st) {
+    const sections = [];
+    // authenticator app
+    const totpBody = h("div");
+    if (st.totp) {
+      totpBody.append(h("p", null, h("span", { class: "tag ok" }, "ativo")),
+        h("button", { class: "btn small danger", onclick: async () => {
+          const pw = await askPassword("Desativar o app autenticador", "Confirme com a sua senha.");
+          if (pw == null) return;
+          try { await api("POST", "/api/2fa/totp/disable", { password: pw }); toast("App autenticador desativado", "ok"); await changed(); } catch (e) { fail2(e); }
+        } }, "Desativar"));
+    } else {
+      totpBody.append(h("p", { class: "muted" }, "Google Authenticator, Authy, 1Password, Microsoft Authenticator e similares."),
+        h("button", { class: "btn small primary", onclick: () => totpSetup(totpBody) }, "Configurar"));
+    }
+    sections.push(h("section", null, h("h3", null, "App autenticador"), totpBody));
+    // e-mail
+    const mailBody = h("div");
+    if (st.email_pin) {
+      mailBody.append(h("p", null, h("span", { class: "tag ok" }, "ativo"), " ", h("span", { class: "muted" }, st.email)),
+        h("button", { class: "btn small danger", onclick: async () => {
+          const pw = await askPassword("Desativar o código por e-mail", "Confirme com a sua senha.");
+          if (pw == null) return;
+          try { await api("POST", "/api/2fa/email/disable", { password: pw }); toast("Código por e-mail desativado", "ok"); await changed(); } catch (e) { fail2(e); }
+        } }, "Desativar"));
+    } else if (st.email_possible) {
+      mailBody.append(h("p", { class: "muted" }, `Enviamos um código de 6 dígitos para ${st.email} a cada login.`),
+        h("button", { class: "btn small primary", onclick: () => emailEnable(mailBody, st.email) }, "Ativar"));
+    } else {
+      mailBody.append(h("p", { class: "muted" }, "Indisponível: o servidor não tem envio de e-mail configurado ou a sua conta não tem e-mail cadastrado (peça a um administrador em Usuários)."));
+    }
+    sections.push(h("section", null, h("h3", null, "Código por e-mail"), mailBody));
+    // recovery
+    if (st.totp || st.email_pin) {
+      sections.push(h("section", null, h("h3", null, "Códigos de recuperação"),
+        h("p", { class: "muted" }, `${st.recovery_left} de 10 códigos restantes.`),
+        h("button", { class: "btn small", onclick: async () => {
+          const pw = await askPassword("Gerar novos códigos", "Os códigos atuais deixam de valer. Confirme com a sua senha.");
+          if (pw == null) return;
+          try { const out = await api("POST", "/api/2fa/recovery", { password: pw }); await changed(out.recovery_codes); } catch (e) { fail2(e); }
+        } }, "Gerar novos códigos")));
+    }
+    box.replaceChildren(...(st.required && !st.totp && !st.email_pin
+      ? [h("div", { class: "warn" }, "A verificação em duas etapas é obrigatória para a sua conta. Ative pelo menos um método para continuar.")] : []), ...sections);
+  }
+
+  async function totpSetup(target) {
+    try {
+      const s = await api("POST", "/api/2fa/totp/setup");
+      const code = h("input", { id: "totp-code", autocomplete: "one-time-code", inputmode: "numeric", maxlength: "7", placeholder: "000000", required: true });
+      const error = h("p", { class: "error", role: "alert" });
+      target.replaceChildren(
+        h("p", { class: "muted" }, "1) Abra o app autenticador e escaneie o QR code (ou digite a chave). 2) Digite o código de 6 dígitos que o app mostrar."),
+        h("img", { class: "qr", src: s.qr, alt: "QR code para o app autenticador", width: "240", height: "240" }),
+        h("p", { class: "muted" }, "Chave manual: ", h("code", { class: "mono" }, s.secret)),
+        h("form", { onsubmit: async (e) => {
+          e.preventDefault();
+          try { const out = await api("POST", "/api/2fa/totp/enable", { code: code.value }); toast("App autenticador ativado", "ok"); await changed(out.recovery_codes); }
+          catch (err) { error.textContent = err.message; code.select(); }
+        } }, h("label", { for: "totp-code" }, "Código do app"), code, error,
+          h("div", { class: "modal-actions" },
+            h("button", { class: "btn", type: "button", onclick: () => reload() }, "Cancelar"),
+            h("button", { class: "btn primary", type: "submit" }, "Ativar"))));
+      code.focus();
+    } catch (e) { fail2(e); }
+  }
+
+  async function emailEnable(target, masked) {
+    try { await api("POST", "/api/2fa/email/send"); } catch (e) { fail2(e); return; }
+    const code = h("input", { id: "email-code", autocomplete: "one-time-code", inputmode: "numeric", maxlength: "7", placeholder: "000000", required: true });
+    const error = h("p", { class: "error", role: "alert" });
+    target.replaceChildren(
+      h("p", { class: "muted" }, `Enviamos um código para ${masked}. Digite-o para confirmar que você recebe os e-mails.`),
+      h("form", { onsubmit: async (e) => {
+        e.preventDefault();
+        try { const out = await api("POST", "/api/2fa/email/enable", { code: code.value }); toast("Código por e-mail ativado", "ok"); await changed(out.recovery_codes); }
+        catch (err) { error.textContent = err.message; code.select(); }
+      } }, h("label", { for: "email-code" }, "Código recebido"), code, error,
+        h("div", { class: "modal-actions" },
+          h("button", { class: "btn", type: "button", onclick: () => reload() }, "Cancelar"),
+          h("button", { class: "btn primary", type: "submit" }, "Ativar"))));
+    code.focus();
+  }
+
+  reload();
+  return box;
+}
+
+function securityModal() {
+  const panel = securityPanel(async () => { try { applyMe(await api("GET", "/api/me")); } catch (_) { /* keep going */ } });
+  const close = modal(h("h2", null, "Verificação em duas etapas"),
+    h("p", { class: "muted" }, "Além da senha, pedimos um segundo fator a cada login."),
+    panel,
+    h("div", { class: "modal-actions" }, h("button", { class: "btn", onclick: () => close() }, "Fechar")));
+}
+
+// forcedSetupView blocks the panel until the policy is met.
+function forcedSetupView() {
+  const panel = securityPanel(async () => {
+    applyMe(await api("GET", "/api/me"));
+    await enterPanel();
+  });
+  return h("div", { class: "login" },
+    h("div", { class: "setup" },
+      h("div", { class: "brand" }, "GO-RTERMINAL"),
+      h("h2", null, "Ative a verificação em duas etapas"),
+      panel,
+      h("div", { class: "modal-actions" }, h("button", { class: "btn", type: "button", onclick: logout }, "Sair"))));
+}
+
 // --- users ---
 const ROLE_LABEL = { admin: "Administrador", operator: "Operador" };
 
@@ -924,13 +1176,18 @@ function usersView() {
   const body = h("tbody");
   const load = () => api("GET", "/api/users").then((users) => {
     body.replaceChildren(...users.map((u) => h("tr", null,
-      h("td", null, h("strong", null, u.username), u.must_change_password && h("span", { class: "tag warn" }, "senha temporária")),
+      h("td", null, h("strong", null, u.username), u.must_change_password && h("span", { class: "tag warn" }, "senha temporária"),
+        h("div", { class: "muted" }, u.email || "sem e-mail")),
       h("td", null, h("span", { class: "tag" }, ROLE_LABEL[u.role] || u.role)),
+      h("td", null, u.totp_enabled && h("span", { class: "tag ok", title: "App autenticador" }, "app"),
+        u.email_pin_enabled && h("span", { class: "tag ok", title: "Código por e-mail" }, "e-mail"),
+        !u.totp_enabled && !u.email_pin_enabled && h("span", { class: "muted" }, "—")),
       h("td", { class: "muted" }, u.role === "admin" ? "todas as máquinas"
         : u.group_ids.length ? u.group_ids.map(groupName).filter(Boolean).join(", ") : "nenhum grupo (não vê máquinas)"),
       h("td", null, h("div", { class: "actions" },
         h("button", { class: "btn small", onclick: () => userModal(u, load) }, "Editar"),
         h("button", { class: "btn small", title: "Gera uma senha temporária e encerra as sessões deste usuário", onclick: () => resetUser(u) }, "Nova senha"),
+        (u.totp_enabled || u.email_pin_enabled) && h("button", { class: "btn small", title: "Remove a verificação em duas etapas (perdeu o celular), encerra as sessões e deixa configurar de novo", onclick: () => reset2FA(u, load) }, "Zerar 2FA"),
         u.username !== state.user && h("button", { class: "btn small danger", onclick: () => deleteUser(u, load) }, "Excluir"),
       )))));
   }).catch(fail);
@@ -940,13 +1197,14 @@ function usersView() {
       h("button", { class: "btn primary", onclick: () => userModal(null, load) }, "+ Novo usuário")),
     h("p", { class: "muted" }, "Administradores veem e gerenciam tudo. Operadores só abrem terminal nas máquinas dos grupos liberados para eles."),
     h("table", null,
-      h("thead", null, h("tr", null, ["Usuário", "Papel", "Acesso", ""].map((x) => h("th", null, x)))),
+      h("thead", null, h("tr", null, ["Usuário", "Papel", "2FA", "Acesso", ""].map((x) => h("th", null, x)))),
       body));
   return h("div", { class: "content" }, main);
 }
 
 function userModal(user, reload) {
   const name = h("input", { id: "u-name", value: user ? user.username : "", required: !user, disabled: !!user, maxlength: "64", autocomplete: "off" });
+  const email = h("input", { id: "u-email", type: "email", value: user ? user.email : "", maxlength: "120", placeholder: "nome@exemplo.com", autocomplete: "off" });
   const role = h("select", { id: "u-role" },
     h("option", { value: "operator", selected: !user || user.role === "operator" }, "Operador (só os grupos marcados)"),
     h("option", { value: "admin", selected: !!user && user.role === "admin" }, "Administrador (acesso total)"));
@@ -963,10 +1221,10 @@ function userModal(user, reload) {
     const group_ids = checks.filter((c) => c.box.checked).map((c) => c.g.id);
     try {
       if (user) {
-        await api("PUT", `/api/users/${user.id}`, { role: role.value, group_ids });
+        await api("PUT", `/api/users/${user.id}`, { role: role.value, group_ids, email: email.value.trim() });
         close(); reload(); toast("Usuário atualizado", "ok");
       } else {
-        const created = await api("POST", "/api/users", { username: name.value, role: role.value, group_ids });
+        const created = await api("POST", "/api/users", { username: name.value, role: role.value, group_ids, email: email.value.trim() });
         close(); reload();
         temporaryPasswordModal(created.user.username, created.temporary_password);
       }
@@ -975,6 +1233,7 @@ function userModal(user, reload) {
     h("h2", null, user ? `Editar ${user.username}` : "Novo usuário"),
     !user && h("p", { class: "muted" }, "Geramos uma senha temporária, mostrada uma única vez. No primeiro login a pessoa precisa trocá-la."),
     h("label", { for: "u-name" }, "Usuário"), name,
+    h("label", { for: "u-email" }, "E-mail (recebe o código do segundo fator)"), email,
     h("label", { for: "u-role" }, "Papel"), role,
     groupsLabel, groupsBox,
     error,
@@ -1004,6 +1263,12 @@ async function resetUser(u) {
     const out = await api("POST", `/api/users/${u.id}/reset`);
     temporaryPasswordModal(u.username, out.temporary_password);
   } catch (e) { fail(e); }
+}
+
+async function reset2FA(u, reload) {
+  if (!confirm(`Remover a verificação em duas etapas de “${u.username}”? As sessões abertas dele serão encerradas e ele poderá entrar só com a senha.`)) return;
+  try { await api("POST", `/api/users/${u.id}/reset-2fa`); reload(); toast("2FA removido", "ok"); }
+  catch (e) { fail(e); }
 }
 
 async function deleteUser(u, reload) {
@@ -1260,14 +1525,8 @@ async function playRecording(rec) {
 // ---------- boot ----------
 (async function boot() {
   try {
-    const me = await api("GET", "/api/me");
-    state.user = me.username;
-    state.role = me.role || "admin";
-    state.mustChange = !!me.must_change_password;
-    state.serverVersion = me.server_version || "";
-    state.downloads = !!me.agent_downloads;
-    state.recording = !!me.recording;
-    if (!state.mustChange) { await refresh(); startPolling(); }
+    applyMe(await api("GET", "/api/me"));
+    if (sessionReady()) { await refresh(); startPolling(); }
   } catch (_) { state.user = null; }
   render();
 })();

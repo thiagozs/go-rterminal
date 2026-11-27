@@ -18,6 +18,31 @@ type Admin struct {
 	// Role is RoleAdmin (full access) or RoleOperator (terminals of the
 	// machines in the groups assigned to the account, nothing else).
 	Role string `json:"role"`
+	// Email receives the login PIN of the e-mail second factor.
+	Email string `json:"email"`
+	// TOTPEnabled / EmailPIN say which second factors the account uses.
+	TOTPEnabled bool `json:"totp_enabled"`
+	EmailPIN    bool `json:"email_pin_enabled"`
+}
+
+// HasTwoFactor reports whether the account must pass a second factor to log in.
+func (a *Admin) HasTwoFactor() bool { return a.TOTPEnabled || a.EmailPIN }
+
+const adminColumns = `id, username, created_at, must_change_password, role, email, totp_enabled, email_2fa`
+
+// scanAdmin reads adminColumns; prefix receives any columns selected before them.
+func scanAdmin(r scanner, prefix ...any) (*Admin, error) {
+	var a Admin
+	var created, mustChange, totp, emailPIN int64
+	dest := append(prefix, &a.ID, &a.Username, &created, &mustChange, &a.Role, &a.Email, &totp, &emailPIN)
+	if err := r.Scan(dest...); err != nil {
+		return nil, err
+	}
+	a.CreatedAt = fromUnix(created)
+	a.MustChangePassword = mustChange != 0
+	a.TOTPEnabled = totp != 0
+	a.EmailPIN = emailPIN != 0
+	return &a, nil
 }
 
 const (
@@ -54,11 +79,8 @@ func boolInt(b bool) int {
 var dummyHash, _ = bcrypt.GenerateFromPassword([]byte("dummy-password"), bcrypt.MinCost)
 
 func (s *Store) VerifyAdmin(username, password string) (*Admin, error) {
-	var a Admin
 	var hash string
-	var created, mustChange int64
-	err := s.db.QueryRow(`SELECT id, username, password_hash, created_at, must_change_password, role FROM admins WHERE username = ?`, username).
-		Scan(&a.ID, &a.Username, &hash, &created, &mustChange, &a.Role)
+	a, err := scanAdmin(s.db.QueryRow(`SELECT password_hash, `+adminColumns+` FROM admins WHERE username = ?`, username), &hash)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 		return nil, ErrInvalidCredentials
@@ -69,9 +91,7 @@ func (s *Store) VerifyAdmin(username, password string) (*Admin, error) {
 	if bcrypt.CompareHashAndPassword([]byte(hash), []byte(password)) != nil {
 		return nil, ErrInvalidCredentials
 	}
-	a.CreatedAt = fromUnix(created)
-	a.MustChangePassword = mustChange != 0
-	return &a, nil
+	return a, nil
 }
 
 // ChangePassword checks the current password, sets the new one, clears the
@@ -140,22 +160,14 @@ func (s *Store) CreateWebSession(adminID int64, ttl time.Duration) (string, erro
 }
 
 func (s *Store) LookupWebSession(token string) (*Admin, error) {
-	var a Admin
-	var created, mustChange int64
-	err := s.db.QueryRow(`
-		SELECT a.id, a.username, a.created_at, a.must_change_password, a.role FROM web_sessions w
+	a, err := scanAdmin(s.db.QueryRow(`
+		SELECT a.id, a.username, a.created_at, a.must_change_password, a.role, a.email, a.totp_enabled, a.email_2fa FROM web_sessions w
 		JOIN admins a ON a.id = w.admin_id
-		WHERE w.token_hash = ? AND w.expires_at > ?`, HashToken(token), unix(time.Now())).
-		Scan(&a.ID, &a.Username, &created, &mustChange, &a.Role)
+		WHERE w.token_hash = ? AND w.expires_at > ?`, HashToken(token), unix(time.Now())))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if err != nil {
-		return nil, err
-	}
-	a.CreatedAt = fromUnix(created)
-	a.MustChangePassword = mustChange != 0
-	return &a, nil
+	return a, err
 }
 
 func (s *Store) DeleteWebSession(token string) error {

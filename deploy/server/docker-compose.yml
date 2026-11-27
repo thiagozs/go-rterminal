@@ -28,6 +28,15 @@ services:
       - "--public-url=https://${DOMAIN:?defina a variavel DOMAIN}"
       # Faixa da rede proxy_net: so ela pode informar o IP real (X-Forwarded-For).
       - "--trusted-proxies=${TRUSTED_PROXIES:-10.0.1.0/24}"
+      # Verificacao em duas etapas: none, admins ou all. O app autenticador
+      # funciona sempre; o codigo por e-mail precisa de RESEND_API_KEY (Resend)
+      # ou de SMTP_HOST (ex: Mailpit para testes), nunca dos dois.
+      - "--require-2fa=${REQUIRE_2FA:-none}"
+      - "--mail-from=${MAIL_FROM:-}"
+      - "--smtp-host=${SMTP_HOST:-}"
+      - "--smtp-port=${SMTP_PORT:-587}"
+      - "--smtp-user=${SMTP_USER:-}"
+      - "--smtp-security=${SMTP_SECURITY:-starttls}"
     environment:
       # Lidas pelo nginx-proxy e pelo acme-companion.
       VIRTUAL_HOST: "${DOMAIN}"
@@ -36,6 +45,9 @@ services:
       # Opcional. Vazia = senha temporaria gerada no primeiro start e mostrada
       # nos logs (troca obrigatoria no primeiro login).
       RTERMINAL_ADMIN_PASSWORD: "${RTERMINAL_ADMIN_PASSWORD:-}"
+      # Segredos do e-mail por variavel de ambiente (nao aparecem na lista de processos).
+      RTERMINAL_RESEND_API_KEY: "${RESEND_API_KEY:-}"
+      RTERMINAL_SMTP_PASSWORD: "${SMTP_PASSWORD:-}"
     expose:
       - "8080"
     volumes:

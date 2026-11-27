@@ -2,7 +2,9 @@ package admin
 
 import (
 	"net/http"
+	"strings"
 
+	"github.com/thiagozs/go-rterminal/internal/mailer"
 	"github.com/thiagozs/go-rterminal/internal/store"
 )
 
@@ -10,12 +12,18 @@ type userInput struct {
 	Username string  `json:"username"`
 	Role     string  `json:"role"`
 	GroupIDs []int64 `json:"group_ids"`
+	Email    string  `json:"email"`
 }
 
 type userUpdate struct {
 	Role     string  `json:"role"`
 	GroupIDs []int64 `json:"group_ids"`
+	// Email is optional: nil keeps the current address, "" removes it.
+	Email *string `json:"email"`
 }
+
+// validEmail accepts an empty address (none registered) or a plain one.
+func validEmail(e string) bool { return e == "" || mailer.ValidAddress(e) }
 
 // userCreated carries the temporary password, shown only once.
 type userCreated struct {
@@ -47,6 +55,11 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, actor *store
 	if !decode(w, r, &in) {
 		return
 	}
+	in.Email = strings.TrimSpace(in.Email)
+	if !validEmail(in.Email) {
+		writeError(w, http.StatusBadRequest, "invalid e-mail address")
+		return
+	}
 	password, err := temporaryPassword()
 	if err != nil {
 		s.storeError(w, err)
@@ -56,6 +69,13 @@ func (s *Server) createUser(w http.ResponseWriter, r *http.Request, actor *store
 	if err != nil {
 		s.storeError(w, err)
 		return
+	}
+	if in.Email != "" {
+		if err := s.store.SetEmail(created.ID, in.Email); err != nil {
+			s.storeError(w, err)
+			return
+		}
+		created.Email = in.Email
 	}
 	s.audit(actor.Username, "user_create", created.Username, "role "+created.Role)
 	user := store.User{Admin: *created, GroupIDs: []int64{}}
@@ -85,11 +105,23 @@ func (s *Server) updateUser(w http.ResponseWriter, r *http.Request, actor *store
 		s.storeError(w, err)
 		return
 	}
+	if in.Email != nil && !validEmail(strings.TrimSpace(*in.Email)) {
+		writeError(w, http.StatusBadRequest, "invalid e-mail address")
+		return
+	}
 	if err := s.store.UpdateUser(id, in.Role, in.GroupIDs); err != nil {
 		s.storeError(w, err)
 		return
 	}
-	s.audit(actor.Username, "user_update", target.Username, "role "+in.Role)
+	detail := "role " + in.Role
+	if in.Email != nil && strings.TrimSpace(*in.Email) != target.Email {
+		if err := s.store.SetEmail(id, *in.Email); err != nil {
+			s.storeError(w, err)
+			return
+		}
+		detail += ", e-mail changed"
+	}
+	s.audit(actor.Username, "user_update", target.Username, detail)
 	w.WriteHeader(http.StatusNoContent)
 }
 

@@ -21,13 +21,17 @@ import (
 	"github.com/thiagozs/go-rterminal/internal/recording"
 	"github.com/thiagozs/go-rterminal/internal/relay"
 	"github.com/thiagozs/go-rterminal/internal/store"
+	"github.com/thiagozs/go-rterminal/internal/twofactor"
 )
 
 //go:embed web
 var webFS embed.FS
 
-// errPasswordChangeRequired is also matched by the UI.
-const errPasswordChangeRequired = "password change required"
+// These messages are also matched by the UI.
+const (
+	errPasswordChangeRequired = "password change required"
+	errTwoFactorSetupRequired = "two-factor setup required"
+)
 
 const (
 	cookieName = "rt_session"
@@ -65,8 +69,21 @@ type Config struct {
 	// Recordings, when set, records every web terminal session for replay in
 	// the audit area. Nil disables recording.
 	Recordings *recording.Manager
-	SessionTTL time.Duration
-	Logger     *log.Logger
+	// Sealer encrypts TOTP secrets in the database. Nil disables two-factor
+	// authentication altogether.
+	Sealer *twofactor.Sealer
+	// Mailer sends the e-mail PIN. Nil leaves the e-mail factor unavailable.
+	Mailer Mailer
+	// Require2FA is "none" (default), "admins" or "all": who must have a
+	// second factor before using the panel.
+	Require2FA string
+	// Issuer names the account in authenticator apps (default "go-rterminal").
+	Issuer string
+	// ChallengeTTL is how long a pending login and an e-mail PIN stay valid
+	// (default 5 minutes).
+	ChallengeTTL time.Duration
+	SessionTTL   time.Duration
+	Logger       *log.Logger
 }
 
 type Server struct {
@@ -77,6 +94,13 @@ type Server struct {
 	agentsDir  string
 	version    string
 	recordings *recording.Manager
+	sealer     *twofactor.Sealer
+	mailer     Mailer
+	require2FA string
+	issuer     string
+	challenges *challengeStore
+	twoFAFails *loginLimiter // wrong second-factor codes per account
+	twoFAIPs   *loginLimiter // wrong second-factor codes per client address
 	sessionTTL time.Duration
 	logger     *log.Logger
 	limiter    *loginLimiter // per client IP (login) and per admin (password change)
@@ -101,11 +125,25 @@ func New(config Config) *Server {
 		agentsDir:  config.AgentsDir,
 		version:    config.Version,
 		recordings: config.Recordings,
+		sealer:     config.Sealer,
+		mailer:     config.Mailer,
+		require2FA: config.Require2FA,
+		issuer:     config.Issuer,
+		twoFAFails: newLoginLimiter(10, 15*time.Minute),
+		twoFAIPs:   newLoginLimiter(10, 5*time.Minute),
 		sessionTTL: ttl,
 		logger:     logger,
 		limiter:    newLoginLimiter(5, 5*time.Minute),
 		userLimit:  newLoginLimiter(30, 15*time.Minute),
 	}
+	if s.issuer == "" {
+		s.issuer = "go-rterminal"
+	}
+	challengeTTL := config.ChallengeTTL
+	if challengeTTL <= 0 {
+		challengeTTL = 5 * time.Minute
+	}
+	s.challenges = newChallengeStore(challengeTTL)
 	s.upgrader = websocket.Upgrader{CheckOrigin: sameOrigin}
 	return s
 }
@@ -117,6 +155,17 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/logout", s.authedAny(s.logout))
 	mux.HandleFunc("GET /api/me", s.authedAny(s.me))
 	mux.HandleFunc("POST /api/password", s.authedAny(s.changePassword))
+
+	mux.HandleFunc("POST /api/login/2fa/send", s.sendLoginPIN)
+	mux.HandleFunc("POST /api/login/2fa/verify", s.verifyLogin2FA)
+	mux.HandleFunc("GET /api/2fa", s.authedSetup(s.twoFactorStatus))
+	mux.HandleFunc("POST /api/2fa/totp/setup", s.authedSetup(s.totpSetup))
+	mux.HandleFunc("POST /api/2fa/totp/enable", s.authedSetup(s.totpEnable))
+	mux.HandleFunc("POST /api/2fa/totp/disable", s.authedSetup(s.totpDisable))
+	mux.HandleFunc("POST /api/2fa/email/send", s.authedSetup(s.emailEnableSend))
+	mux.HandleFunc("POST /api/2fa/email/enable", s.authedSetup(s.emailEnable))
+	mux.HandleFunc("POST /api/2fa/email/disable", s.authedSetup(s.emailDisable))
+	mux.HandleFunc("POST /api/2fa/recovery", s.authedSetup(s.recoveryRegenerate))
 
 	mux.HandleFunc("GET /api/groups", s.authed(s.listGroups))
 	mux.HandleFunc("POST /api/groups", s.adminOnly(s.createGroup))
@@ -134,6 +183,7 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/users/{id}", s.adminOnly(s.updateUser))
 	mux.HandleFunc("DELETE /api/users/{id}", s.adminOnly(s.deleteUser))
 	mux.HandleFunc("POST /api/users/{id}/reset", s.adminOnly(s.resetUser))
+	mux.HandleFunc("POST /api/users/{id}/reset-2fa", s.adminOnly(s.resetUser2FA))
 
 	mux.HandleFunc("GET /api/recordings", s.adminOnly(s.listRecordings))
 	mux.HandleFunc("GET /api/recordings/{id}/cast", s.adminOnly(s.recordingCast))
@@ -182,17 +232,36 @@ func (s *Server) adminFromCookie(r *http.Request) (*store.Admin, bool) {
 	return admin, true
 }
 
-// authed requires a logged-in admin who has no pending password change.
+// authed requires a logged-in admin with nothing pending: no temporary
+// password to replace and no second factor still to set up.
 func (s *Server) authed(next authedHandler) http.HandlerFunc {
-	return s.authedWith(next, false)
+	return s.authedWith(next, false, false)
 }
 
-// authedAny also admits admins who must still change a temporary password.
+// authedAny also admits accounts that must still change a temporary password
+// or set up a second factor.
 func (s *Server) authedAny(next authedHandler) http.HandlerFunc {
-	return s.authedWith(next, true)
+	return s.authedWith(next, true, true)
 }
 
-func (s *Server) authedWith(next authedHandler, allowPending bool) http.HandlerFunc {
+// authedSetup admits accounts that must still set up a second factor (they
+// need these endpoints to do it) but not those with a temporary password.
+func (s *Server) authedSetup(next authedHandler) http.HandlerFunc {
+	return s.authedWith(next, false, true)
+}
+
+// pendingStep returns what the account must do before using the panel, or "".
+func (s *Server) pendingStep(admin *store.Admin) string {
+	if admin.MustChangePassword {
+		return errPasswordChangeRequired
+	}
+	if s.needsTwoFactorSetup(admin) {
+		return errTwoFactorSetupRequired
+	}
+	return ""
+}
+
+func (s *Server) authedWith(next authedHandler, allowPassword, allowSetup bool) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if !checkCSRF(r) {
 			writeError(w, http.StatusForbidden, "missing "+csrfHeader+" header")
@@ -203,8 +272,12 @@ func (s *Server) authedWith(next authedHandler, allowPending bool) http.HandlerF
 			writeError(w, http.StatusUnauthorized, "login required")
 			return
 		}
-		if admin.MustChangePassword && !allowPending {
+		if admin.MustChangePassword && !allowPassword {
 			writeError(w, http.StatusForbidden, errPasswordChangeRequired)
+			return
+		}
+		if !allowSetup && s.needsTwoFactorSetup(admin) {
+			writeError(w, http.StatusForbidden, errTwoFactorSetupRequired)
 			return
 		}
 		next(w, r, admin)
@@ -395,6 +468,16 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 	}
 	s.limiter.reset(ip)
 	s.userLimit.reset(user)
+	// With a second factor the password alone opens nothing: no cookie yet.
+	if s.sealer != nil && admin.HasTwoFactor() {
+		s.beginTwoFactor(w, admin)
+		return
+	}
+	s.startSession(w, r, admin, "")
+}
+
+// startSession issues the cookie and answers with the session view.
+func (s *Server) startSession(w http.ResponseWriter, r *http.Request, admin *store.Admin, detail string) {
 	token, err := s.store.CreateWebSession(admin.ID, s.sessionTTL)
 	if err != nil {
 		s.storeError(w, err)
@@ -405,7 +488,7 @@ func (s *Server) login(w http.ResponseWriter, r *http.Request) {
 		SameSite: http.SameSiteStrictMode, Secure: s.secure(r),
 		Expires: time.Now().Add(s.sessionTTL),
 	})
-	s.audit(admin.Username, "login", ip, "")
+	s.audit(admin.Username, "login", s.clientIP(r), detail)
 	_ = s.store.PurgeExpiredSessions()
 	writeJSON(w, http.StatusOK, s.sessionView(admin))
 }
@@ -428,6 +511,8 @@ func (s *Server) sessionView(admin *store.Admin) map[string]any {
 		"server_version":       s.version,
 		"agent_downloads":      len(s.agentTargets()) > 0,
 		"recording":            s.recordings != nil,
+		"must_setup_2fa":       s.needsTwoFactorSetup(admin),
+		"two_factor_available": s.sealer != nil,
 	}
 }
 
@@ -586,8 +671,8 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusUnauthorized, "login required")
 		return
 	}
-	if admin.MustChangePassword {
-		writeError(w, http.StatusForbidden, errPasswordChangeRequired)
+	if pending := s.pendingStep(admin); pending != "" {
+		writeError(w, http.StatusForbidden, pending)
 		return
 	}
 	machine, err := s.store.GetMachine(r.URL.Query().Get("machine"))

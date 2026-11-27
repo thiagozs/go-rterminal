@@ -315,3 +315,121 @@ func TestOperatorAccessFollowsGroups(t *testing.T) {
 		t.Errorf("deleting last admin = %v, want ErrLastAdmin", err)
 	}
 }
+
+func TestTwoFactorStateAndReplayGuard(t *testing.T) {
+	s := newTestStore(t)
+	u, _ := s.CreateAdmin("ana", "password-1", false)
+	if u.HasTwoFactor() {
+		t.Fatal("a new account has no second factor")
+	}
+	if err := s.SetTOTPPending(u.ID, "sealed-pending"); err != nil {
+		t.Fatal(err)
+	}
+	if p, _ := s.TOTPPending(u.ID); p != "sealed-pending" {
+		t.Fatalf("pending = %q", p)
+	}
+	if err := s.EnableTOTP(u.ID, "sealed-secret", 100); err != nil {
+		t.Fatal(err)
+	}
+	sealed, last, enabled, _ := s.TOTPSecret(u.ID)
+	if sealed != "sealed-secret" || last != 100 || !enabled {
+		t.Fatalf("secret = %q %d %v", sealed, last, enabled)
+	}
+	if p, _ := s.TOTPPending(u.ID); p != "" {
+		t.Fatal("pending secret must be cleared once enabled")
+	}
+	// Only a strictly newer step advances: the guard behind "a code works once".
+	for _, c := range []struct {
+		step int64
+		want bool
+	}{{100, false}, {99, false}, {101, true}, {101, false}, {102, true}} {
+		if got, _ := s.AdvanceTOTPStep(u.ID, c.step); got != c.want {
+			t.Errorf("advance(%d) = %v, want %v", c.step, got, c.want)
+		}
+	}
+	got, _ := s.VerifyAdmin("ana", "password-1")
+	if !got.TOTPEnabled || !got.HasTwoFactor() {
+		t.Fatalf("login view = %+v", got)
+	}
+}
+
+func TestRecoveryCodesAreSingleUseAndReplaceable(t *testing.T) {
+	s := newTestStore(t)
+	u, _ := s.CreateAdmin("ana", "password-1", false)
+	if err := s.ReplaceRecoveryCodes(u.ID, []string{"h1", "h2", "h3"}); err != nil {
+		t.Fatal(err)
+	}
+	if ok, _ := s.UseRecoveryCode(u.ID, "h1"); !ok {
+		t.Fatal("first use refused")
+	}
+	if ok, _ := s.UseRecoveryCode(u.ID, "h1"); ok {
+		t.Fatal("a recovery code worked twice")
+	}
+	if ok, _ := s.UseRecoveryCode(u.ID+1, "h2"); ok {
+		t.Fatal("another account's code worked")
+	}
+	if n, _ := s.RecoveryCodesLeft(u.ID); n != 2 {
+		t.Fatalf("left = %d", n)
+	}
+	_ = s.ReplaceRecoveryCodes(u.ID, []string{"n1"})
+	if ok, _ := s.UseRecoveryCode(u.ID, "h2"); ok {
+		t.Fatal("an old code survived the replacement")
+	}
+}
+
+func TestClearTwoFactorEndsSessionsAndForgetsEverything(t *testing.T) {
+	s := newTestStore(t)
+	u, _ := s.CreateAdmin("ana", "password-1", false)
+	_ = s.SetEmail(u.ID, "ana@x.co")
+	_ = s.SetEmailPIN(u.ID, true)
+	_ = s.EnableTOTP(u.ID, "sealed", 5)
+	_ = s.ReplaceRecoveryCodes(u.ID, []string{"h1"})
+	token, _ := s.CreateWebSession(u.ID, time.Hour)
+
+	if err := s.ClearTwoFactor(u.ID); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := s.GetUser(u.ID)
+	if got.HasTwoFactor() || got.Email != "ana@x.co" {
+		t.Fatalf("after clear = %+v (the e-mail address itself must stay)", got)
+	}
+	if n, _ := s.RecoveryCodesLeft(u.ID); n != 0 {
+		t.Fatal("recovery codes left")
+	}
+	if _, err := s.LookupWebSession(token); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("session survived: %v", err)
+	}
+	if err := s.ClearTwoFactor(9999); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown account: %v", err)
+	}
+	// Clearing the address also switches the e-mail factor off.
+	_ = s.SetEmailPIN(u.ID, true)
+	_ = s.SetEmail(u.ID, "")
+	if got, _ := s.GetUser(u.ID); got.EmailPIN {
+		t.Fatal("e-mail factor stayed on without an address")
+	}
+}
+
+func TestMigrationAddsTwoFactorColumnsToOlderDatabases(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, _ := sql.Open("sqlite", "file:"+path)
+	if _, err := old.Exec(`CREATE TABLE admins (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE, password_hash TEXT NOT NULL,
+		created_at INTEGER NOT NULL, must_change_password INTEGER NOT NULL DEFAULT 0, role TEXT NOT NULL DEFAULT 'admin');
+		INSERT INTO admins(username, password_hash, created_at) VALUES('legacy', 'x', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	u, err := s.UserByName("legacy")
+	if err != nil || u.HasTwoFactor() || u.Email != "" {
+		t.Fatalf("legacy = %+v, %v", u, err)
+	}
+	if err := s.EnableTOTP(u.ID, "x", 1); err != nil {
+		t.Fatal(err)
+	}
+}

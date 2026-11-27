@@ -22,6 +22,7 @@ import (
 	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/relay"
 	"github.com/thiagozs/go-rterminal/internal/store"
+	"github.com/thiagozs/go-rterminal/internal/twofactor"
 	"golang.org/x/crypto/bcrypt"
 )
 
@@ -71,7 +72,11 @@ func newEnvWithStore(t *testing.T, tweak func(*Config, *store.Store)) *env {
 		SessionTimeout: 3 * time.Second,
 		Logger:         quiet,
 	})
-	cfg := Config{Store: st, Relay: rl, Logger: quiet}
+	sealer, err := twofactor.NewSealer(bytes.Repeat([]byte{7}, 32))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := Config{Store: st, Relay: rl, Logger: quiet, Sealer: sealer}
 	tweak(&cfg, st)
 	adm := New(cfg)
 

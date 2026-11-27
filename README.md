@@ -156,6 +156,46 @@ A aba **Usuarios** (so para administradores) cadastra quem entra no painel. Ha d
 - O sistema nao deixa excluir ou rebaixar o **ultimo administrador**, e ninguem exclui a propria conta.
 - Excluir um grupo tira o acesso de quem so o tinha por ele; as contas permanecem.
 
+### Verificacao em duas etapas (2FA)
+
+Depois da senha, o login pode exigir um **segundo fator**. Cada pessoa ativa o que preferir em **Seguranca** (topo do painel):
+
+| Fator | Como funciona | Depende de |
+| --- | --- | --- |
+| **App autenticador (TOTP)** | codigo de 6 digitos do Google Authenticator, Authy, 1Password etc., lido de um QR code | nada: funciona offline |
+| **Codigo por e-mail** | PIN de 6 digitos enviado ao e-mail cadastrado, valido por 5 minutos e de uso unico | Resend ou SMTP configurado e e-mail no cadastro (**Usuarios > Editar**) |
+| **Codigos de recuperacao** | 10 codigos de uso unico, mostrados **uma vez** ao ativar o primeiro fator | nada |
+
+- **Fluxo**: usuario e senha corretos nao abrem sessao nenhuma; so depois do segundo fator o cookie e emitido. Para ativar o e-mail, a pessoa digita de volta um PIN enviado a ele (prova que a caixa e dela).
+- **Obrigatoriedade**: `--require-2fa=admins` (ou `all`) deixa quem ainda nao tem fator **so na tela de configuracao** ate ativar um; a API, o terminal e o resto respondem `403`. Com a politica ativa, o ultimo fator nao pode ser removido.
+- **Protecoes**: o codigo do app vale **uma vez** (replay recusado) e aceita 1 passo de relogio; cada login pendente aceita 5 tentativas e expira em 5 minutos; ha limite por conta (10 erros/15 min) e por IP; o reenvio do PIN espera 60 s e vale ate 5 e-mails por login. Desativar um fator ou gerar novos codigos pede a **senha**.
+- **Segredos**: a semente do TOTP fica **cifrada** (AES-GCM) no banco; a chave esta em `2fa.key`, ao lado do banco (`0600`). Isso protege um dump so do banco, mas **nao** um backup do volume `/data` inteiro (que leva as duas coisas): proteja o backup. Os PINs e codigos de recuperacao ficam so como hash.
+- **Perdeu o celular e os codigos?** Um administrador usa **Usuarios > Zerar 2FA** (encerra as sessoes da pessoa). Se foi o unico administrador: `server reset-2fa --db rterminal.db --user admin` (em Docker, `docker exec <container> /usr/local/bin/server reset-2fa --db /data/rterminal.db --user admin`).
+- **Auditoria**: `2fa_enabled`, `2fa_disabled`, `2fa_failed`, `2fa_pin_sent`, `2fa_recovery_used`, `2fa_recovery_regenerated`, `user_2fa_reset`; o login registra qual fator foi usado.
+- **Limites desta versao**: o PIN por e-mail e mais fraco que o app (quem controla a caixa de e-mail passa por ele), entao para administradores prefira o app e deixe o e-mail como reserva. Nao ha "lembrar este dispositivo" nem WhatsApp/Telegram (o canal de mensagem e o e-mail).
+
+**Envio de e-mail** (so para o codigo por e-mail; o app autenticador nao precisa). Escolha **um** provedor:
+
+- **Resend** (producao), pela [API oficial](https://resend.com) e o SDK em Go. O dominio do remetente precisa estar verificado no Resend (para um primeiro teste, ele aceita `onboarding@resend.dev`):
+
+  ```bash
+  RTERMINAL_RESEND_API_KEY=re_xxx server --db rterminal.db --require-2fa=admins \
+    --mail-from "Painel <painel@exemplo.com>"
+  ```
+
+- **SMTP** (qualquer servidor, ou o [Mailpit](https://mailpit.axllent.org) para testar):
+
+  ```bash
+  server --db rterminal.db --smtp-host smtp.exemplo.com --smtp-port 587 --smtp-security starttls \
+    --smtp-user painel@exemplo.com --mail-from "Painel <painel@exemplo.com>"   # senha: RTERMINAL_SMTP_PASSWORD
+  ```
+
+  `--smtp-security` aceita `starttls` (587, recusa se o servidor nao oferecer), `tls` (465) e `none` (so para relay local, como o Mailpit).
+
+As chaves vao por variavel de ambiente (`RTERMINAL_RESEND_API_KEY`, `RTERMINAL_SMTP_PASSWORD`) para nao aparecerem no `ps`. Informar os dois provedores e erro. Sem nenhum, so o app autenticador fica disponivel.
+
+**Testar com o Mailpit.** Ele so recebe e mostra os e-mails (nada sai de verdade), ideal para ver o PIN sem configurar um provedor. A interface web do Mailpit nao serve para enviar: o server fala com a porta **SMTP** dele (1025), entao o server precisa alcanca-la. No Swarm, ponha o Mailpit na mesma rede `proxy_net` e use `SMTP_HOST=<nome do servico> SMTP_PORT=1025 SMTP_SECURITY=none`; o PIN aparece na interface web do Mailpit.
+
 ### Gravacao e reproducao de sessoes
 
 Cada terminal aberto no painel e **gravado** e fica em **Auditoria > Sessoes gravadas** (so para administradores). O terminal mostra o que acontece: a gravacao nao e escondida de quem usa, mas confira a politica da sua equipe antes de ativar.
@@ -252,6 +292,8 @@ O banco em `/data` e preservado entre atualizacoes.
 - `--admin-user` usuario do primeiro administrador (padrao `admin`); a senha inicial e temporaria, gerada e logada uma vez (ou vem de `RTERMINAL_ADMIN_PASSWORD`)
 - `--agents-dir` pasta com os binarios `agent-<os>-<arch>` distribuidos em `/download/agent/` (padrao `$RTERMINAL_AGENTS_DIR`)
 - `--trusted-proxies` CIDRs dos proxies reversos cujo `X-Forwarded-For` e confiavel (ex: `172.16.0.0/12`); sem isso, atras de um proxy todos os logins pareceriam vir do IP do proxy
+- `--require-2fa` quem deve ter segundo fator: `none` (padrao), `admins` ou `all`; `--2fa-issuer` nome no app autenticador
+- `--mail-from` e `RTERMINAL_RESEND_API_KEY` (Resend), ou `--smtp-host`, `--smtp-port`, `--smtp-user`, `--smtp-security` e `RTERMINAL_SMTP_PASSWORD` (SMTP): envio do codigo por e-mail (veja [2FA](#verificacao-em-duas-etapas-2fa))
 - `--recordings` grava as sessoes do terminal web (padrao `true`, so com `--db`); `--recordings=false` desliga
 - `--recordings-dir` pasta das gravacoes (padrao: `recordings` ao lado do `--db`, ou seja, dentro de `/data` no Docker)
 - `--recordings-max-mb` tamanho maximo de uma gravacao (padrao `50`); ao passar, a gravacao e cortada com um aviso

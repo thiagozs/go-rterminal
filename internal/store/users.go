@@ -81,22 +81,18 @@ func (s *Store) adminCount(tx *sql.Tx) (int, error) {
 
 // ListUsers returns every account with its groups.
 func (s *Store) ListUsers() ([]User, error) {
-	rows, err := s.db.Query(`SELECT id, username, created_at, must_change_password, role FROM admins ORDER BY username`)
+	rows, err := s.db.Query(`SELECT ` + adminColumns + ` FROM admins ORDER BY username`)
 	if err != nil {
 		return nil, err
 	}
 	var users []User
 	for rows.Next() {
-		var u User
-		var created, mustChange int64
-		if err := rows.Scan(&u.ID, &u.Username, &created, &mustChange, &u.Role); err != nil {
+		a, err := scanAdmin(rows)
+		if err != nil {
 			rows.Close()
 			return nil, err
 		}
-		u.CreatedAt = fromUnix(created)
-		u.MustChangePassword = mustChange != 0
-		u.GroupIDs = []int64{}
-		users = append(users, u)
+		users = append(users, User{Admin: *a, GroupIDs: []int64{}})
 	}
 	rows.Close()
 	if err := rows.Err(); err != nil {
@@ -125,19 +121,11 @@ func (s *Store) ListUsers() ([]User, error) {
 
 // GetUser returns one account.
 func (s *Store) GetUser(id int64) (*Admin, error) {
-	var a Admin
-	var created, mustChange int64
-	err := s.db.QueryRow(`SELECT id, username, created_at, must_change_password, role FROM admins WHERE id = ?`, id).
-		Scan(&a.ID, &a.Username, &created, &mustChange, &a.Role)
+	a, err := scanAdmin(s.db.QueryRow(`SELECT `+adminColumns+` FROM admins WHERE id = ?`, id))
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
-	if err != nil {
-		return nil, err
-	}
-	a.CreatedAt = fromUnix(created)
-	a.MustChangePassword = mustChange != 0
-	return &a, nil
+	return a, err
 }
 
 // UserGroupIDs lists the groups an account may reach, sorted.
