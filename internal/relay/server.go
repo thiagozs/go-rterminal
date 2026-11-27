@@ -4,7 +4,9 @@ import (
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log"
+	"net"
 	"net/http"
 	"sync"
 	"time"
@@ -31,10 +33,14 @@ type Config struct {
 	// AgentAuth, when set, switches agents to per-machine credentials: it
 	// resolves a bearer token to the machine id it belongs to.
 	AgentAuth func(token string) (agentID string, ok bool)
-	// OnAgentConnected / OnAgentDisconnected observe agent registrations.
+	// OnAgentConnected / OnAgentDisconnected observe agent registrations; the
+	// disconnect callback says why the connection ended.
 	OnAgentConnected    func(id string, info protocol.Message)
-	OnAgentDisconnected func(id string)
-	SessionTimeout      time.Duration
+	OnAgentDisconnected func(id, reason string)
+	// OnAgentEvents receives the connection events an agent kept while it
+	// was offline (see protocol.TypeDiagnostics).
+	OnAgentEvents  func(id string, events []protocol.Event)
+	SessionTimeout time.Duration
 	// KeepAliveInterval controls liveness pings; zero uses
 	// DefaultKeepAliveInterval and a negative value disables them.
 	KeepAliveInterval time.Duration
@@ -45,7 +51,8 @@ type Server struct {
 	authToken      string
 	agentAuth      func(token string) (string, bool)
 	onConnected    func(id string, info protocol.Message)
-	onDisconnected func(id string)
+	onDisconnected func(id, reason string)
+	onEvents       func(id string, events []protocol.Event)
 	sessionTimeout time.Duration
 	keepAlive      time.Duration
 	logger         *log.Logger
@@ -59,6 +66,7 @@ type Server struct {
 type agentConn struct {
 	conn    *websocket.Conn
 	writeMu sync.Mutex
+	caps    []string // what the agent said it can do when it registered
 }
 
 func (a *agentConn) writeJSON(value any) error {
@@ -82,6 +90,18 @@ type session struct {
 	conns   []*websocket.Conn
 	timer   *time.Timer
 	tap     Tap // optional observer of a web terminal session
+	mon     Monitor
+	kind    string
+}
+
+// Monitor watches every message relayed on a channel opened with OpenChannel,
+// in both directions, and may end the channel by returning an error (the
+// error text becomes the close reason). Calls come from two goroutines, so
+// implementations must be safe for concurrent use. Close is called once, after
+// the channel ended.
+type Monitor interface {
+	Message(fromAgent bool, messageType int, data []byte) error
+	Close()
 }
 
 // Tap observes the traffic of a session opened with OpenTerminal, e.g. to
@@ -110,6 +130,7 @@ func New(config Config) *Server {
 		agentAuth:      config.AgentAuth,
 		onConnected:    config.OnAgentConnected,
 		onDisconnected: config.OnAgentDisconnected,
+		onEvents:       config.OnAgentEvents,
 		sessionTimeout: config.SessionTimeout,
 		logger:         logger,
 		agents:         make(map[string]*agentConn),
@@ -211,7 +232,7 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	_ = ws.SetReadDeadline(time.Time{})
 
-	agent := &agentConn{conn: ws}
+	agent := &agentConn{conn: ws, caps: msg.Capabilities}
 	replaced, ok := s.registerAgent(msg.AgentID, agent)
 	if !ok {
 		s.logger.Printf("[server] registro recusado, agente já conectado | agent=%s", msg.AgentID)
@@ -222,9 +243,10 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 		closeWebSocket(replaced.conn, websocket.CloseNormalClosure, "agent replaced")
 		s.logger.Printf("[server] conexão inativa substituída | agent=%s", msg.AgentID)
 	}
+	reason := "desconhecido"
 	defer func() {
 		if s.removeAgent(msg.AgentID, agent) && s.onDisconnected != nil {
-			s.onDisconnected(msg.AgentID)
+			s.onDisconnected(msg.AgentID, reason)
 		}
 	}()
 
@@ -234,11 +256,35 @@ func (s *Server) agentHandler(w http.ResponseWriter, r *http.Request) {
 	}
 	defer s.startKeepAlive(ws)()
 	for {
-		if _, _, err := ws.ReadMessage(); err != nil {
-			s.logger.Printf("[server] agente desconectado | agent=%s", msg.AgentID)
+		messageType, data, err := ws.ReadMessage()
+		if err != nil {
+			reason = disconnectReason(err)
+			s.logger.Printf("[server] agente desconectado | agent=%s | %s", msg.AgentID, reason)
 			return
 		}
+		if messageType != websocket.TextMessage || s.onEvents == nil {
+			continue
+		}
+		var report protocol.Message
+		if json.Unmarshal(data, &report) == nil && report.Type == protocol.TypeDiagnostics && len(report.Events) > 0 {
+			s.onEvents(msg.AgentID, report.Events)
+		}
 	}
+}
+
+// disconnectReason explains in a few words why an agent's connection ended.
+func disconnectReason(err error) string {
+	var closeErr *websocket.CloseError
+	var netErr net.Error
+	switch {
+	case errors.As(err, &closeErr) && closeErr.Code == websocket.CloseAbnormalClosure:
+		return "a conexão caiu sem aviso (rede do agent ou proxy)"
+	case errors.As(err, &closeErr):
+		return fmt.Sprintf("o agent fechou a conexão (código %d)", closeErr.Code)
+	case errors.As(err, &netErr) && netErr.Timeout():
+		return "o agent parou de responder aos pings (rede caiu ou a máquina dormiu)"
+	}
+	return err.Error()
 }
 
 // registerAgent claims id for agent. An existing registration is kept (and ok
@@ -297,6 +343,36 @@ func (s *Server) Disconnect(id string, reason string) {
 	}
 }
 
+// SendToAgent writes a control message to the agent of machineID.
+func (s *Server) SendToAgent(machineID string, msg protocol.Message) error {
+	s.mu.Lock()
+	agent := s.agents[machineID]
+	s.mu.Unlock()
+	if agent == nil {
+		return ErrAgentOffline
+	}
+	if err := agent.writeJSON(msg); err != nil {
+		return ErrAgentOffline
+	}
+	return nil
+}
+
+// AgentHas reports whether the connected agent of machineID advertised capability.
+func (s *Server) AgentHas(machineID, capability string) bool {
+	s.mu.Lock()
+	agent := s.agents[machineID]
+	s.mu.Unlock()
+	if agent == nil {
+		return false
+	}
+	for _, c := range agent.caps {
+		if c == capability {
+			return true
+		}
+	}
+	return false
+}
+
 // ErrAgentOffline is returned when no agent is registered for a machine.
 var ErrAgentOffline = errors.New("agent offline")
 
@@ -305,6 +381,16 @@ var ErrAgentOffline = errors.New("agent offline")
 // end. The relay owns conn from here on; the agent joins as the second end.
 // tap, when not nil, observes the session once the agent joins.
 func (s *Server) OpenTerminal(machineID string, conn *websocket.Conn, tap Tap) (string, error) {
+	return s.openSession(machineID, "", conn, tap, nil)
+}
+
+// OpenChannel is OpenTerminal for sessions that are not a shell: the agent is
+// asked to serve kind (e.g. protocol.KindFiles) and mon sees what is relayed.
+func (s *Server) OpenChannel(machineID, kind string, conn *websocket.Conn, mon Monitor) (string, error) {
+	return s.openSession(machineID, kind, conn, nil, mon)
+}
+
+func (s *Server) openSession(machineID, kind string, conn *websocket.Conn, tap Tap, mon Monitor) (string, error) {
 	s.mu.Lock()
 	agent := s.agents[machineID]
 	s.mu.Unlock()
@@ -314,10 +400,12 @@ func (s *Server) OpenTerminal(machineID string, conn *websocket.Conn, tap Tap) (
 	conn.SetReadLimit(maxMessageSize)
 	state := s.createSession(machineID)
 	state.tap = tap
+	state.mon = mon
+	state.kind = kind
 	s.mu.Lock()
 	state.conns = append(state.conns, conn)
 	s.mu.Unlock()
-	if err := agent.writeJSON(protocol.Message{Type: protocol.TypeStartSession, SessionID: state.id}); err != nil {
+	if err := agent.writeJSON(protocol.Message{Type: protocol.TypeStartSession, SessionID: state.id, Kind: kind}); err != nil {
 		s.removeAgent(machineID, agent)
 		s.deleteSession(state.id, state)
 		return "", ErrAgentOffline
@@ -457,13 +545,14 @@ func (s *Server) sessionHandler(w http.ResponseWriter, r *http.Request) {
 
 	if pair[0] != nil {
 		s.logger.Printf("[server] sessão pareada | session=%s", id)
-		go s.bridgePair(id, pair[0], pair[1], state.tap)
+		go s.bridgePair(id, pair[0], pair[1], state.tap, state.mon)
 	}
 }
 
 // bridgePair relays a (the first end: the browser for web sessions) and b (the
-// agent). tap, when set, sees b's output and a's resize requests.
-func (s *Server) bridgePair(id string, a, b *websocket.Conn, tap Tap) {
+// agent). tap, when set, sees b's output and a's resize requests; mon, when
+// set, sees every message and can end the session.
+func (s *Server) bridgePair(id string, a, b *websocket.Conn, tap Tap, mon Monitor) {
 	var once sync.Once
 	closePair := func() {
 		once.Do(func() {
@@ -485,30 +574,37 @@ func (s *Server) bridgePair(id string, a, b *websocket.Conn, tap Tap) {
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	var onFromA, onFromB func(messageType int, data []byte)
+	var onFromA, onFromB func(messageType int, data []byte) error
 	if tap != nil {
 		defer tap.Close()
-		onFromA = func(messageType int, data []byte) {
+		onFromA = func(messageType int, data []byte) error {
 			if messageType != websocket.TextMessage {
-				return
+				return nil
 			}
 			var msg protocol.Message
 			if json.Unmarshal(data, &msg) == nil && msg.Type == protocol.TypeResize && msg.Cols > 0 && msg.Rows > 0 {
 				tap.Resize(int(msg.Cols), int(msg.Rows))
 			}
+			return nil
 		}
-		onFromB = func(messageType int, data []byte) {
+		onFromB = func(messageType int, data []byte) error {
 			if messageType == websocket.BinaryMessage {
 				tap.Output(data)
 			}
+			return nil
 		}
+	}
+	if mon != nil {
+		defer mon.Close()
+		onFromA = func(messageType int, data []byte) error { return mon.Message(false, messageType, data) }
+		onFromB = func(messageType int, data []byte) error { return mon.Message(true, messageType, data) }
 	}
 	go func() { defer wg.Done(); defer closePair(); s.relayMessages(a, b, onFromA) }()
 	go func() { defer wg.Done(); defer closePair(); s.relayMessages(b, a, onFromB) }()
 	wg.Wait()
 }
 
-func (s *Server) relayMessages(src, dst *websocket.Conn, observe func(messageType int, data []byte)) {
+func (s *Server) relayMessages(src, dst *websocket.Conn, observe func(messageType int, data []byte) error) {
 	for {
 		messageType, data, err := src.ReadMessage()
 		if err != nil {
@@ -517,7 +613,12 @@ func (s *Server) relayMessages(src, dst *websocket.Conn, observe func(messageTyp
 		}
 		s.extendReadDeadline(src)
 		if observe != nil {
-			observe(messageType, data)
+			if err := observe(messageType, data); err != nil {
+				// The monitor ended the channel: both ends learn why.
+				closeWebSocket(src, websocket.ClosePolicyViolation, err.Error())
+				closeWebSocket(dst, websocket.ClosePolicyViolation, err.Error())
+				return
+			}
 		}
 		_ = dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := dst.WriteMessage(messageType, data); err != nil {

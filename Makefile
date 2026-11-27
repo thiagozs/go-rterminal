@@ -6,6 +6,8 @@ AUTH_TOKEN ?=
 DB ?= rterminal.db
 IMAGE ?= thiagozs/go-rterminal
 IMAGE_TAG ?= server-$(shell date +%Y%m%d)
+# Cada build tem uma versao propria (data + hora), para o painel distinguir dois builds do mesmo dia.
+BUILD_VERSION ?= $(IMAGE_TAG)-$(shell date +%H%M)
 PUBLIC_URL ?=
 TLS_CERT ?=
 TLS_KEY ?=
@@ -72,7 +74,7 @@ run-server-admin:
 		$(if $(TLS_KEY),--tls-key $(TLS_KEY),)
 
 image-server:
-	docker build --target server --build-arg VERSION=$(IMAGE_TAG) -t $(IMAGE):server -t $(IMAGE):latest -t $(IMAGE):$(IMAGE_TAG) .
+	docker build --target server --build-arg VERSION=$(BUILD_VERSION) -t $(IMAGE):server -t $(IMAGE):latest -t $(IMAGE):$(IMAGE_TAG) .
 
 push-server:
 	docker push $(IMAGE):server

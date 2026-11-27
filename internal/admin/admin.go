@@ -15,9 +15,12 @@ import (
 	"net/url"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/thiagozs/go-rterminal/internal/live"
+	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/recording"
 	"github.com/thiagozs/go-rterminal/internal/relay"
 	"github.com/thiagozs/go-rterminal/internal/store"
@@ -48,6 +51,9 @@ type Relay interface {
 	IsOnline(id string) bool
 	Disconnect(id, reason string)
 	OpenTerminal(machineID string, conn *websocket.Conn, tap relay.Tap) (string, error)
+	OpenChannel(machineID, kind string, conn *websocket.Conn, mon relay.Monitor) (string, error)
+	SendToAgent(machineID string, msg protocol.Message) error
+	AgentHas(machineID, capability string) bool
 }
 
 type Config struct {
@@ -69,6 +75,10 @@ type Config struct {
 	// Recordings, when set, records every web terminal session for replay in
 	// the audit area. Nil disables recording.
 	Recordings *recording.Manager
+	// DisableFiles turns off file transfer (browsing, uploads and downloads).
+	DisableFiles bool
+	// MaxTransferBytes caps one transferred file (default 512 MB).
+	MaxTransferBytes int64
 	// Sealer encrypts TOTP secrets in the database. Nil disables two-factor
 	// authentication altogether.
 	Sealer *twofactor.Sealer
@@ -94,6 +104,11 @@ type Server struct {
 	agentsDir  string
 	version    string
 	recordings *recording.Manager
+	live       *live.Hub
+	files      bool
+	maxFile    int64
+	digestMu   sync.Mutex
+	digests    map[string]string // agent binary digests, see agentDigest
 	sealer     *twofactor.Sealer
 	mailer     Mailer
 	require2FA string
@@ -125,6 +140,9 @@ func New(config Config) *Server {
 		agentsDir:  config.AgentsDir,
 		version:    config.Version,
 		recordings: config.Recordings,
+		live:       live.NewHub(),
+		files:      !config.DisableFiles,
+		maxFile:    config.MaxTransferBytes,
 		sealer:     config.Sealer,
 		mailer:     config.Mailer,
 		require2FA: config.Require2FA,
@@ -142,6 +160,9 @@ func New(config Config) *Server {
 	challengeTTL := config.ChallengeTTL
 	if challengeTTL <= 0 {
 		challengeTTL = 5 * time.Minute
+	}
+	if s.maxFile <= 0 {
+		s.maxFile = defaultMaxTransfer
 	}
 	s.challenges = newChallengeStore(challengeTTL)
 	s.upgrader = websocket.Upgrader{CheckOrigin: sameOrigin}
@@ -177,6 +198,8 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("PUT /api/machines/{id}", s.adminOnly(s.updateMachine))
 	mux.HandleFunc("DELETE /api/machines/{id}", s.adminOnly(s.deleteMachine))
 	mux.HandleFunc("POST /api/machines/{id}/rotate", s.adminOnly(s.rotateMachine))
+	mux.HandleFunc("GET /api/machines/{id}/events", s.adminOnly(s.machineEvents))
+	mux.HandleFunc("POST /api/machines/{id}/update", s.adminOnly(s.updateAgent))
 
 	mux.HandleFunc("GET /api/users", s.adminOnly(s.listUsers))
 	mux.HandleFunc("POST /api/users", s.adminOnly(s.createUser))
@@ -190,7 +213,10 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("DELETE /api/recordings/{id}", s.adminOnly(s.deleteRecording))
 
 	mux.HandleFunc("GET /api/audit", s.adminOnly(s.listAudit))
+	mux.HandleFunc("GET /api/sessions", s.adminOnly(s.listLiveSessions))
 	mux.HandleFunc("GET /ws/terminal", s.terminal)
+	mux.HandleFunc("GET /ws/watch", s.watch)
+	mux.HandleFunc("GET /ws/files", s.filesChannel)
 	mux.HandleFunc("GET /download/agent/{target}", s.downloadAgent)
 
 	static, _ := fs.Sub(webFS, "web")
@@ -511,6 +537,7 @@ func (s *Server) sessionView(admin *store.Admin) map[string]any {
 		"server_version":       s.version,
 		"agent_downloads":      len(s.agentTargets()) > 0,
 		"recording":            s.recordings != nil,
+		"file_transfer":        s.files,
 		"must_setup_2fa":       s.needsTwoFactorSetup(admin),
 		"two_factor_available": s.sealer != nil,
 	}
@@ -701,14 +728,18 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
 	}
 	// The recorder creates its file at the first event, so a session that
 	// never starts leaves nothing behind.
-	var tap relay.Tap
+	var recTap relay.Tap
 	detail := ""
 	if s.recordings != nil {
 		rec := s.recordings.Start(recording.Meta{MachineID: machine.ID, MachineName: machine.Name, Username: admin.Username})
-		tap = rec
+		recTap = rec
 		detail = " recording " + rec.ID()
 	}
-	sessionID, err := s.relay.OpenTerminal(machine.ID, conn, tap)
+	liveSession := s.live.Begin("", machine.ID, machine.Name, admin.Username)
+	sessionID, err := s.relay.OpenTerminal(machine.ID, conn, relay.MultiTap(recTap, liveSession))
+	if err == nil {
+		liveSession.SetID(sessionID)
+	}
 	if err != nil {
 		reason := "could not start session"
 		if errors.Is(err, relay.ErrAgentOffline) {

@@ -231,6 +231,89 @@ O botao **Terminal** abre um shell da maquina no navegador (xterm.js). Prompts c
 - **Diagnostico**: o botao grava o que o terminal envia e recebe (com `\e` e `\b` visiveis) e mostra o buffer interno do xterm, para comparar o que ele guarda com o que aparece na tela. Util para investigar problemas de exibicao. Nao grave senhas.
 - O shell e o definido por `--shell` (padrao `/bin/bash`). Para abrir direto no zsh com Oh My Zsh, use `--shell /usr/bin/zsh` (ou o caminho de `which zsh`) no servico do agent e o usuario que roda o servico deve ter o `~/.zshrc` configurado.
 
+### Espectador ao vivo
+
+Administradores podem assistir, so leitura, a um terminal que outra pessoa tem aberto agora: menu **Ao vivo**, botao **Assistir**.
+
+- A lista mostra quem esta com terminal aberto, em qual maquina e ha quanto tempo, e se atualiza sozinha.
+- Ao entrar, o espectador recebe o tamanho do terminal e as ultimas linhas (ate 128 KB) e depois acompanha em tempo real. Quando a sessao termina, a tela avisa.
+- E somente leitura: o que o espectador envia e descartado pelo server e nunca chega ao shell. Ele tambem ve apenas a saida do terminal, nunca o que a pessoa digita (senhas sem eco nao aparecem), como na gravacao.
+- Um espectador lento e desconectado em vez de atrasar a sessao de quem esta usando.
+- Cada visualizacao gera `watch_start` e `watch_end` na auditoria. A pessoa observada nao recebe aviso na tela.
+- Quando o replay corta uma sequencia de escape no meio (sessao com muita saida), o inicio da tela pode aparecer desalinhado ate o proximo redesenho.
+- Operadores nao veem a lista nem conseguem assistir. A funcao nao depende da gravacao: funciona com `--recordings=false`.
+- Endpoints (administrador): `GET /api/sessions` e WebSocket `/ws/watch?session=ID`.
+
+### Historico de conexao (por que a maquina ficou offline)
+
+O agent anota sozinho o que acontece com a conexao e o painel mostra isso depois, sem voce precisar entrar na maquina: botao **Historico** na linha da maquina (so administradores).
+
+O que o **agent** registra:
+- `agent_start` / `agent_stop`: quando iniciou e quando parou normalmente. Se a execucao anterior nao terminou normalmente, o evento de inicio avisa (queda de energia, reinicio forcado ou falha) e informa ha quanto tempo a maquina esta ligada, o que distingue reboot de reinicio do servico.
+- `lost`: conexao perdida, depois de quanto tempo, a causa e o estado da rede naquele instante (interfaces e Wi-Fi com sinal em dBm, rota padrao).
+- `connect_failed`: a primeira falha de cada queda, com a causa: DNS, rede sem rota, conexao recusada, HTTP 502/503 (proxy no ar, servidor fora), credencial recusada, certificado TLS, tempo esgotado.
+- `connected`: reconexao, com o tempo offline, o numero de tentativas e a causa da queda.
+- `suspend`: a maquina dormiu ou congelou por mais de 15 s (o relogio do sistema avanca mas o monotonico nao), que e o que acontece ao suspender.
+
+O **servidor** acrescenta o que ele viu: `online` e `offline`, com o motivo (conexao caiu sem aviso, parou de responder aos pings, o agent fechou).
+
+Como funciona: os eventos vao para o arquivo do agent (JSON por linha, modo `0600`, gira em 1 MB) e sao enviados ao servidor assim que a conexao volta, entao o que aconteceu enquanto estava offline nao se perde. Ficam 30 dias, no maximo 1000 eventos por maquina. Dentro de uma queda longa, so a primeira falha e registrada por inteiro; o evento de reconexao resume o resto.
+
+Para ler direto na maquina: `sudo tail -n 20 /var/lib/rterminal-agent/events.jsonl`.
+
+Para ter esse historico, atualize o agent das maquinas (botao **Atualizar agent**). Agents antigos continuam funcionando, mas nao enviam eventos; o servidor so registra `online`/`offline` deles.
+
+### Atualizar o agent pelo painel
+
+Com o agent ja atualizado uma vez pelo comando manual, as proximas versoes chegam com um clique: botao **Atualizar agora** na linha da maquina (so administradores, aparece quando o agent esta desatualizado).
+
+O que acontece:
+1. O servidor pede ao agent que se atualize e informa a versao nova e o SHA-256 do binario que ele distribui.
+2. O agent baixa o binario do **proprio servidor** a que esta conectado (com a credencial da maquina), confere o SHA-256 e **executa o binario novo com `--version`** para ter certeza de que roda nesta maquina e e a versao pedida.
+3. Guarda o binario atual como `<agent>.old`, troca o arquivo de forma atomica e sai. O systemd (`Restart=always`) sobe a versao nova em ~5 s.
+4. A versao nova confirma ao reconectar (`update_ok` no Historico). **Se nao reconectar em 2 minutos, ou reiniciar 3 vezes sem conseguir, o agent volta sozinho para o `.old`** (`update_rollback`).
+
+Condicoes e limites:
+- O agent so anuncia a funcao quando consegue de fato: Linux, rodando como servico do systemd **e com permissao para gravar na pasta do binario** (por padrao `/usr/local/bin`). Se o servico roda com um usuario sem essa permissao (ou com `ProtectSystem`), o painel nao oferece "Atualizar agora": mostra o botao do comando manual, e o evento de inicio do agent, no Historico, diz o motivo. Para habilitar com o servico rodando como usuario comum (por exemplo para ter o zsh e o Oh My Zsh dele no terminal), use [`--shell-user`](#terminal-como-outro-usuario-agent-como-root): o agent roda como root, abre o terminal como o seu usuario e passa a poder se atualizar. O comando manual de atualizacao acha o binario pelo `ExecStart` do servico, onde quer que ele esteja.
+- So Linux e so quando o agent roda como **servico do systemd** (o comando gerado pelo painel instala assim). Rodando solto num terminal, ninguem o subiria de novo; o pedido e recusado com a explicacao no Historico.
+- Terminais abertos na maquina terminam quando o agent reinicia; o painel avisa e pede confirmacao.
+- Agents antigos (sem esta funcao) precisam do comando manual **uma vez**; o painel so mostra "Atualizar agora" para os que sabem se atualizar.
+- O servidor precisa ter uma versao de build (a imagem oficial tem) e o binario da arquitetura da maquina em `--agents-dir`. Cada build tem versao propria (`server-AAAAMMDD-HHMM`), entao dois builds no mesmo dia sao distinguidos.
+- Para recusar pedidos do painel numa maquina, inicie o agent com `--no-self-update`.
+- Cada pedido fica na auditoria como `agent_update` (`versao antiga -> nova`).
+
+### Transferencia de arquivos
+
+Botao **Arquivos** na linha da maquina (administradores e operadores com acesso a ela). Abre um gerenciador de arquivos da maquina remota:
+
+- **Navegar**: pastas primeiro, tamanho e data; campo de caminho editavel, botao de pasta acima, recarregar e **Nova pasta**.
+- **Baixar**: botao em cada arquivo; o navegador recebe o arquivo em pedacos de 64 KB e salva no fim.
+- **Enviar**: botao **Enviar arquivos** (varios de uma vez) ou **arrastar e soltar** sobre a tela, sempre para a pasta aberta. Se o arquivo ja existe, o painel pergunta antes de substituir (e a substituicao mantem as permissoes do arquivo original).
+- Cada transferencia mostra uma barra de progresso. Se a conexao cair no meio de um envio, nada fica pela metade: o agent grava num arquivo temporario ao lado e so renomeia quando chegou tudo.
+
+Como funciona e limites:
+- Tudo trafega por WebSocket (o mesmo canal que o terminal usa), entao nao esbarra no limite de corpo (`client_max_body_size`) do nginx-proxy. O servidor so confere quem pode, audita e aplica o limite de tamanho; o conteudo vai direto do navegador ao agent.
+- O limite (`--max-transfer-mb`, padrao 512 MB) conta os bytes que realmente passaram pelo servidor, nao o tamanho declarado: quem anuncia pouco e manda muito tambem e cortado. O download fica em memoria do navegador ate terminar, entao arquivos muito grandes pesam la.
+- A transferencia roda com as permissoes do **usuario do terminal** da maquina (`--shell-user`; sem ele, as do usuario que roda o agent, que no comando gerado pelo painel sem `--shell-user` e **root**): le e grava o que esse usuario pode, o mesmo alcance do terminal dele, e os arquivos enviados pertencem a ele. A pasta inicial e o home desse usuario.
+- Auditoria: `file_channel` (canal aberto), `file_upload`, `file_download` e `file_mkdir` com o caminho e os bytes, e `file_failed` para o que foi recusado, interrompido ou passou do limite. Listar pastas nao e registrado. Operador fora dos grupos da maquina recebe 404 e fica em `file_denied`.
+- So arquivos comuns sao baixados (nao pastas nem dispositivos). Nao ha exclusao nem renomeacao pelo painel; para isso use o terminal.
+- Exige agent atualizado: agents antigos nao anunciam a funcao e o botao fica desabilitado com a explicacao. Desative por servidor com `--files=false` (`FILE_TRANSFER=false` na stack) ou por maquina com `--no-files` no agent.
+
+### Terminal como outro usuario (agent como root)
+
+Em vez de rodar o agent **como** o seu usuario (`User=` na unit), rode-o como **root** e diga qual usuario abre cada terminal: `--shell-user thiago`. No cadastro da maquina (e em **Editar**) o campo **Usuario do terminal** faz o painel gerar o comando de instalacao assim: a unit fica **sem** `User=` e o `ExecStart` ganha `--shell-user thiago`. O valor fica guardado na maquina, entao o comando gerado ao **gerar nova credencial** continua certo.
+
+O que muda e o que continua igual:
+- Cada terminal abre como o usuario escolhido, com o uid, o gid e **todos os grupos** dele, o `HOME`, o `USER`/`LOGNAME` e o **shell de login do cadastro do sistema** (o zsh dele, se for o caso; `--shell` explicito tem prioridade). O pty e entregue a esse usuario, e o `sudo` funciona se ele estiver no sudoers.
+- A **transferencia de arquivos** tambem roda como ele: nao le `/etc/shadow` nem `/root`, nao grava em `/etc`, e o que voce envia pertence a ele. O agent troca as credenciais de arquivo so na thread da sessao (Linux), que e descartada no fim, entao nada vaza para o resto do agent.
+- O agent, sendo root, grava em `/usr/local/bin`: a **atualizacao automatica funciona** sem nenhum ajuste de pastas.
+- O terminal **nao herda** a credencial do agent (`RTERMINAL_*`) nem as variaveis do systemd (`INVOCATION_ID`, `NOTIFY_SOCKET`...), e nao herda o que e do root (`HOME`, `XDG_*`, `SUDO_*`, `SSH_AUTH_SOCK`...).
+- Sem `--shell-user`, tudo continua como antes. O agent recusa iniciar se o usuario nao existe, ou se `--shell-user` e usado por um agent que nao e root.
+
+Para uma maquina que ja usa `User=`: abra **Atualizar agent** (menu ⋯), rode o comando de atualizacao e, em seguida, o comando de **Servico rodando como usuario comum**. Ele tira o `User=`, acrescenta `--shell-user` com o mesmo usuario e reinicia; recusa-se a mexer em um agent que ainda nao tem a flag.
+
+Custo de seguranca: antes, comprometer o agent dava um shell de usuario comum (o `sudo` ainda pedia senha); agora o processo do agent e root, e a protecao passa a depender do codigo dele. Por isso o shell e os arquivos sao rebaixados ao usuario escolhido e so a atualizacao e o download do proprio binario ficam com root. Plataformas sem credenciais por thread (macOS) abrem o terminal como o usuario, mas nao oferecem arquivos com `--shell-user`.
+
 ### Download do agent
 
 A imagem do server leva o agent compilado para `linux/amd64`, `linux/arm64`, `linux/arm` (ARMv6 e superiores, como todos os Raspberry Pi), `darwin/amd64` e `darwin/arm64`, e os distribui em `GET /download/agent/<os>-<arch>`. O comando gerado pelo painel:
@@ -297,6 +380,8 @@ O banco em `/data` e preservado entre atualizacoes.
 - `--recordings` grava as sessoes do terminal web (padrao `true`, so com `--db`); `--recordings=false` desliga
 - `--recordings-dir` pasta das gravacoes (padrao: `recordings` ao lado do `--db`, ou seja, dentro de `/data` no Docker)
 - `--recordings-max-mb` tamanho maximo de uma gravacao (padrao `50`); ao passar, a gravacao e cortada com um aviso
+- `--files` permite enviar e baixar arquivos das maquinas pelo painel (padrao `true`; so com `--db`)
+- `--max-transfer-mb` tamanho maximo de um arquivo enviado ou baixado (padrao `512`)
 - `--recordings-retention-days` apaga gravacoes mais antigas (padrao `90`, `0` guarda para sempre)
 - `--tls-cert` caminho do certificado TLS (opcional)
 - `--tls-key` caminho da chave TLS (opcional)
@@ -314,6 +399,10 @@ O banco em `/data` e preservado entre atualizacoes.
 - `--backoff-max` backoff maximo para reconexao (padrao `60s`)
 - `--keepalive-interval` intervalo de keepalive no controle (padrao `15s`, `0` desativa)
 - `--max-sessions` maximo de sessoes de shell simultaneas (padrao `8`, `0` sem limite)
+- `--shell-user NOME` abre os terminais e a transferencia de arquivos como este usuario; o agent roda como root (veja [Terminal como outro usuario](#terminal-como-outro-usuario-agent-como-root))
+- `--no-files` nao oferece transferencia de arquivos pelo painel
+- `--no-self-update` recusa o pedido de atualizacao automatica vindo do painel
+- `--events-file` diario de eventos de conexao (padrao `/var/lib/rterminal-agent/events.jsonl` como root, ou `~/.local/state/rterminal-agent/events.jsonl`; `off` desativa)
 
 ### client
 

@@ -30,8 +30,9 @@ const state = {
   serverVersion: "", // build of this server; agents on another build are flagged
   downloads: false,  // server ships agent binaries (enables the update command)
   recording: false,  // server records web terminal sessions (audit > recorded sessions)
+  fileTransfer: false, // server allows browsing, sending and downloading files
   auditTab: "events", // events | recordings
-  view: "machines", // machines | users | audit
+  view: "machines", // machines | users | live | audit
   groups: [],
   machines: [],
   filter: "all", // all | none | <group id>
@@ -57,7 +58,9 @@ async function api(method, path, body) {
     if (resp.status === 401 && data && data.error === "login required") { state.user = null; state.pending2FA = null; render(); }
     if (resp.status === 403 && data && data.error === "password change required") { state.mustChange = true; render(); }
     if (resp.status === 403 && data && data.error === "two-factor setup required") { state.mustSetup2FA = true; render(); }
-    throw new APIError(resp.status, (data && data.error) || resp.statusText);
+    const err = new APIError(resp.status, (data && data.error) || resp.statusText);
+    err.data = data;
+    throw err;
   }
   return data;
 }
@@ -110,6 +113,7 @@ function applyMe(me) {
   state.serverVersion = me.server_version || "";
   state.downloads = !!me.agent_downloads;
   state.recording = !!me.recording;
+  state.fileTransfer = !!me.file_transfer;
 }
 const sessionReady = () => !state.mustChange && !state.mustSetup2FA;
 
@@ -174,7 +178,7 @@ function shell() {
   return h("div", { class: "shell" },
     h("header", { class: "topbar" },
       h("span", { class: "brand" }, "GO-RTERMINAL"),
-      h("nav", { class: "nav" }, navBtn("machines", "Máquinas"), isAdmin() && navBtn("users", "Usuários"), isAdmin() && navBtn("audit", "Auditoria")),
+      h("nav", { class: "nav" }, navBtn("machines", "Máquinas"), isAdmin() && navBtn("users", "Usuários"), isAdmin() && navBtn("live", "Ao vivo"), isAdmin() && navBtn("audit", "Auditoria")),
       h("span", { class: "spacer" }),
       workspace && h("button", { class: "btn small primary", title: "Voltar aos terminais abertos", onclick: () => workspace.show() }, `Terminais (${workspace.count()})`),
       h("span", { class: "muted" }, state.user),
@@ -182,7 +186,7 @@ function shell() {
       h("button", { class: "btn small", onclick: () => passwordModal() }, "Alterar senha"),
       h("button", { class: "btn small", onclick: logout }, "Sair"),
     ),
-    state.view === "users" && isAdmin() ? usersView() : state.view === "audit" && isAdmin() ? auditView() : machinesView(),
+    state.view === "users" && isAdmin() ? usersView() : state.view === "live" && isAdmin() ? liveView() : state.view === "audit" && isAdmin() ? auditView() : machinesView(),
   );
 }
 
@@ -299,9 +303,25 @@ function isOutdated(m) {
 
 function versionBadge(m) {
   if (!m.version) return null;
-  return h("div", { class: "muted", title: `agent ${m.version}` },
-    "agent ", h("span", { class: "mono" }, m.version),
-    isOutdated(m) && h("span", { class: "tag warn", title: `O server está em ${state.serverVersion}. Use "Atualizar agent".` }, "desatualizado"));
+  return h("div", { class: "muted version", title: `agent ${m.version}` },
+    "agent ", h("span", { class: "mono nowrap" }, shortVersion(m.version)),
+    isOutdated(m) && h("span", { class: "tag warn", title: `O server está em ${state.serverVersion}.` }, "desatualizado"));
+}
+
+// updateNow asks the agent to update itself. Terminals open on the machine end
+// when it restarts, so the server asks for confirmation first.
+async function updateNow(m, force) {
+  try {
+    await api("POST", `/api/machines/${encodeURIComponent(m.id)}/update`, force ? { force: true } : {});
+    toast(`Atualização pedida a ${m.name}. Ela reinicia em instantes; acompanhe em Histórico.`, "ok");
+    setTimeout(() => refresh().then(render).catch(() => {}), 15000);
+  } catch (e) {
+    if (e.status === 409 && e.data && e.data.sessions) {
+      if (confirm(`${m.name} tem ${e.data.sessions} terminal(is) aberto(s). Eles serão encerrados quando o agent reiniciar. Atualizar mesmo assim?`)) return updateNow(m, true);
+      return;
+    }
+    fail(e);
+  }
 }
 
 // updateModal shows the command that downloads the current agent and restarts
@@ -309,9 +329,12 @@ function versionBadge(m) {
 // secret appears here.
 function updateModal(m) {
   const base = location.origin;
+  const unit = "/etc/systemd/system/rterminal-agent.service";
   const script = [
     "# Baixa o agent atual deste server e reinicia o servico (Linux, precisa de sudo e curl)",
     "TOKEN=$(sudo sed -n 's/^RTERMINAL_TOKEN=//p' /etc/rterminal-agent.env)",
+    "# O binario e o que o servico executa (pode nao estar em /usr/local/bin)",
+    `BIN=$(sed -n 's/^ExecStart=\\([^ ]*\\).*/\\1/p' ${unit}); BIN=\${BIN:-/usr/local/bin/agent}`,
     'case "$(uname -m)" in',
     "  x86_64) ARCH=amd64 ;;",
     "  aarch64|arm64) ARCH=arm64 ;;",
@@ -319,12 +342,32 @@ function updateModal(m) {
     '  *) echo "arquitetura nao suportada: $(uname -m)" >&2; exit 1 ;;',
     "esac",
     `printf 'Authorization: Bearer %s\\n' "$TOKEN" | curl -fsSL -H @- "${base}/download/agent/linux-$ARCH" -o /tmp/rterminal-agent`,
-    "sudo install -m 755 /tmp/rterminal-agent /usr/local/bin/agent.new && sudo mv -f /usr/local/bin/agent.new /usr/local/bin/agent && rm -f /tmp/rterminal-agent",
+    'sudo install -m 755 /tmp/rterminal-agent "$BIN.new" && sudo mv -f "$BIN.new" "$BIN" && rm -f /tmp/rterminal-agent',
     "sudo systemctl restart rterminal-agent",
-    "unset TOKEN ARCH",
+    "unset TOKEN ARCH BIN",
+  ].join("\n");
+  // For services that run as a normal user (User= in the unit): run the
+  // service as root and open terminals and files as that user instead.
+  const autoScript = [
+    "# Passa o servico a rodar como root e abrir terminais e arquivos como o usuario que ele usa hoje",
+    `UNIT=${unit}`,
+    "SVC_USER=$(systemctl show -p User --value rterminal-agent)",
+    `BIN=$(sed -n 's/^ExecStart=\\([^ ]*\\).*/\\1/p' $UNIT)`,
+    'if [ -z "$SVC_USER" ] || [ "$SVC_USER" = root ]; then',
+    '  echo "O servico ja roda como root. Para abrir o terminal como outro usuario, acrescente --shell-user NOME ao ExecStart de $UNIT."',
+    'elif ! "$BIN" --help 2>&1 | grep -q -- --shell-user; then',
+    '  echo "Este agent ainda nao tem --shell-user: rode antes o comando de atualizacao acima."',
+    "else",
+    `  sudo sed -i -e '/^User=/d' -e "s#^\\(ExecStart=.*\\)#\\1 --shell-user $SVC_USER#" $UNIT &&`,
+    "  sudo systemctl daemon-reload && sudo systemctl restart rterminal-agent &&",
+    '  echo "Pronto: o agent roda como root e abre terminais e arquivos como $SVC_USER."',
+    "fi",
+    "unset UNIT SVC_USER BIN",
   ].join("\n");
   const copyBtn = h("button", { class: "btn small" }, "Copiar");
   copyBtn.addEventListener("click", () => copy(script, copyBtn));
+  const autoBtn = h("button", { class: "btn small" }, "Copiar");
+  autoBtn.addEventListener("click", () => copy(autoScript, autoBtn));
   const close = modal(
     h("h2", null, `Atualizar o agent de “${m.name}”`),
     h("p", { class: "muted" }, m.version
@@ -333,28 +376,80 @@ function updateModal(m) {
     h("p", { class: "muted" }, "Rode na máquina. Serve para serviços instalados pelo comando do painel (systemd, credencial em /etc/rterminal-agent.env). A credencial não muda."),
     h("pre", { class: "cmd", tabindex: "0" }, script),
     h("div", { class: "row" }, copyBtn),
+    h("h3", { style: "margin-top:18px" }, "Serviço rodando como usuário comum (User= na unit)"),
+    h("p", { class: "muted" }, "Com User= o agent não tem permissão para trocar o próprio binário e o botão “Atualizar agora” não aparece. Depois do comando acima, rode este: ele tira o User= e passa o serviço a rodar como root com --shell-user, então cada terminal e cada transferência de arquivos continua abrindo como o seu usuário (mesmo shell, mesmo HOME, mesmas permissões) e o agent pode se atualizar. Se o serviço já roda como root, não faz nada."),
+    h("pre", { class: "cmd", tabindex: "0" }, autoScript),
+    h("div", { class: "row" }, autoBtn),
     h("div", { class: "modal-actions" }, h("button", { class: "btn primary", onclick: () => close() }, "Concluir")),
   );
 }
 
+// openMenu shows a small popup menu next to anchor. items: {label, onclick,
+// title, danger} or "-" for a separator. It closes on a click elsewhere,
+// Escape, scrolling or resizing.
+function openMenu(anchor, items) {
+  document.querySelectorAll(".menu").forEach((m) => m.remove());
+  const menu = h("div", { class: "menu", role: "menu" },
+    ...items.filter(Boolean).map((it) => it === "-" ? h("div", { class: "menu-sep", role: "separator" })
+      : h("button", { class: "menu-item" + (it.danger ? " danger" : ""), role: "menuitem", title: it.title || "", type: "button",
+          onclick: () => { close(); it.onclick(); } }, it.label)));
+  document.body.append(menu);
+  const rect = anchor.getBoundingClientRect();
+  const width = menu.offsetWidth, height = menu.offsetHeight;
+  menu.style.left = `${Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8))}px`;
+  menu.style.top = `${rect.bottom + 4 + height > window.innerHeight ? Math.max(8, rect.top - height - 4) : rect.bottom + 4}px`;
+  anchor.setAttribute("aria-expanded", "true");
+  const onDown = (e) => { if (!menu.contains(e.target) && e.target !== anchor) close(); };
+  const onKey = (e) => { if (e.key === "Escape") { close(); anchor.focus(); } };
+  function close() {
+    menu.remove();
+    anchor.setAttribute("aria-expanded", "false");
+    document.removeEventListener("mousedown", onDown, true);
+    document.removeEventListener("keydown", onKey, true);
+    window.removeEventListener("resize", close);
+    window.removeEventListener("scroll", close, true);
+  }
+  document.addEventListener("mousedown", onDown, true);
+  document.addEventListener("keydown", onKey, true);
+  window.addEventListener("resize", close);
+  window.addEventListener("scroll", close, true);
+  const first = menu.querySelector(".menu-item");
+  if (first) first.focus();
+}
+
+// shortVersion drops the "server-" prefix so a build fits on one line.
+const shortVersion = (v) => v.replace(/^server-/, "");
+
 function machinesTable(list) {
-  const rows = list.map((m) => h("tr", null,
-    h("td", null, h("span", { class: "dot" + (m.online ? " on" : ""), title: m.online ? "online" : "offline" }),
-      h("strong", null, m.name), h("div", { class: "mono muted" }, m.id)),
-    h("td", null, m.group_id != null ? h("span", { class: "tag" }, groupName(m.group_id)) : h("span", { class: "muted" }, "—")),
-    h("td", null, m.hostname ? `${m.hostname}` : "—", h("div", { class: "muted" }, [m.os, m.arch].filter(Boolean).join("/")),
-      versionBadge(m)),
-    h("td", { class: "muted" }, m.online ? "online" : timeAgo(m.last_seen)),
-    h("td", null, h("div", { class: "actions" },
-      h("button", { class: "btn small primary", disabled: !m.online, title: m.online ? "" : "Máquina offline", onclick: () => openTerminal(m) }, "Terminal"),
-      isAdmin() && h("button", { class: "btn small", onclick: () => machineModal(m) }, "Editar"),
-      isAdmin() && state.downloads && m.os === "linux" && h("button", { class: "btn small" + (isOutdated(m) ? " primary" : ""), title: "Comando para atualizar o agent desta máquina, sem trocar a credencial", onclick: () => updateModal(m) }, "Atualizar agent"),
-      isAdmin() && h("button", { class: "btn small", title: "Gera uma nova credencial e desconecta o agent atual", onclick: () => rotate(m) }, "Nova credencial"),
-      isAdmin() && h("button", { class: "btn small danger", onclick: () => removeMachine(m) }, "Excluir"),
-    )),
-  ));
-  return h("table", null,
-    h("thead", null, h("tr", null, ["Máquina", "Grupo", "Host", "Visto", ""].map((t) => h("th", null, t)))),
+  const rows = list.map((m) => {
+    const outdated = isOutdated(m);
+    return h("tr", null,
+      h("td", { class: "col-name" }, h("span", { class: "dot" + (m.online ? " on" : ""), title: m.online ? "online" : "offline" }),
+        h("strong", null, m.name), h("div", { class: "mono muted" }, m.id),
+        !m.online && h("div", { class: "muted small-note" }, "visto " + timeAgo(m.last_seen))),
+      h("td", { class: "col-group" }, m.group_id != null ? h("span", { class: "tag" }, groupName(m.group_id)) : h("span", { class: "muted" }, "—")),
+      h("td", { class: "col-host" }, m.hostname ? `${m.hostname}` : "—", h("div", { class: "muted" }, [m.os, m.arch].filter(Boolean).join("/")),
+        versionBadge(m),
+        m.shell_user && h("div", { class: "muted small-note", title: "Terminais e arquivos abrem como este usuário" }, "terminal como ", h("span", { class: "mono" }, m.shell_user)),
+        isAdmin() && m.can_self_update && outdated && h("button", { class: "btn small primary update-now", title: `Atualiza o agent de ${m.version} para ${state.serverVersion} sem você colar nada: ele baixa a versão nova do servidor, confere o checksum, reinicia e volta sozinho. Se não reconectar em 2 minutos, volta para a versão anterior.`, onclick: () => updateNow(m) }, "Atualizar agora"),
+        isAdmin() && outdated && !m.can_self_update && state.downloads && m.os === "linux" && h("button", { class: "btn small primary update-now", title: "Este agent não consegue se atualizar sozinho (o motivo está no Histórico, no evento de início do agent). Use o comando manual, que roda com sudo na máquina.", onclick: () => updateModal(m) }, "Atualizar agent")),
+      h("td", { class: "col-actions" }, h("div", { class: "actions" },
+        h("button", { class: "btn small primary", disabled: !m.online, title: m.online ? "" : "Máquina offline", onclick: () => openTerminal(m) }, "Terminal"),
+        state.fileTransfer && h("button", { class: "btn small", disabled: !m.can_files,
+          title: !m.online ? "Máquina offline" : m.can_files ? "Navegar, enviar e baixar arquivos" : "Este agent é antigo e não faz transferência de arquivos: atualize-o", onclick: () => openFiles(m) }, "Arquivos"),
+        isAdmin() && h("button", { class: "btn small", title: "Quedas, suspensões e reconexões desta máquina", onclick: () => historyModal(m) }, "Histórico"),
+        isAdmin() && h("button", { class: "btn small icon", "aria-label": `Mais ações para ${m.name}`, "aria-haspopup": "menu", "aria-expanded": "false", title: "Mais ações",
+          onclick: (e) => openMenu(e.currentTarget, [
+            { label: "Editar", onclick: () => machineModal(m) },
+            state.downloads && m.os === "linux" && { label: "Atualizar agent (comando manual)", title: "Comando para atualizar o agent desta máquina, sem trocar a credencial", onclick: () => updateModal(m) },
+            { label: "Nova credencial", title: "Gera uma nova credencial e desconecta o agent atual", onclick: () => rotate(m) },
+            "-",
+            { label: "Excluir máquina", danger: true, onclick: () => removeMachine(m) },
+          ]) }, "⋯"),
+      )));
+  });
+  return h("table", { class: "machines" },
+    h("thead", null, h("tr", null, ["Máquina", "Grupo", "Host", ""].map((t) => h("th", null, t)))),
     h("tbody", null, rows));
 }
 
@@ -369,6 +464,44 @@ function modal(...content) {
   const first = overlay.querySelector("input, select, button");
   if (first) first.focus();
   return close;
+}
+
+// historyModal shows why a machine went offline: what its agent noticed
+// (suspension, lost network, ...) next to what the server observed.
+const EVENT_LABEL = {
+  agent_start: ["Agent iniciou", ""], agent_stop: ["Agent parou", ""],
+  connected: ["Conectou", "ok"], online: ["Online", "ok"],
+  lost: ["Conexão perdida", "warn"], offline: ["Offline", "warn"],
+  connect_failed: ["Falha ao conectar", "warn"], suspend: ["Máquina suspensa", "warn"],
+  update_started: ["Atualização iniciada", ""], update_ok: ["Atualizado", "ok"],
+  update_failed: ["Atualização falhou", "warn"], update_rollback: ["Atualização desfeita", "warn"],
+};
+function historyModal(machine) {
+  const body = h("tbody");
+  const load = () => api("GET", `/api/machines/${encodeURIComponent(machine.id)}/events?limit=300`).then((events) => {
+    if (!events.length) {
+      body.replaceChildren(h("tr", null, h("td", { colspan: "4", class: "muted" }, "Nenhum evento registrado ainda. Agents antigos não enviam histórico: atualize o agent desta máquina.")));
+      return;
+    }
+    body.replaceChildren(...events.map((e) => {
+      const [label, kind] = EVENT_LABEL[e.kind] || [e.kind, ""];
+      return h("tr", null,
+        h("td", { class: "mono", style: "white-space:nowrap" }, new Date(e.at).toLocaleString()),
+        h("td", { class: "muted" }, e.source === "agent" ? "agent" : "servidor"),
+        h("td", null, h("span", { class: "tag " + kind }, label)),
+        h("td", { class: "muted" }, e.detail));
+    }));
+  }).catch(fail);
+  load();
+  const close = modal(
+    h("h2", null, `Histórico de ${machine.name}`),
+    h("p", { class: "muted" }, "O agent anota sozinho o que acontece com a conexão (suspensão, rede, reinício) e envia ao reconectar; o servidor anota quando viu a máquina ficar online ou offline. Guardado por 30 dias, no máximo 1000 eventos por máquina."),
+    h("div", { class: "history" }, h("table", { class: "audit" },
+      h("thead", null, h("tr", null, ["Quando", "Origem", "Evento", "Detalhe"].map((x) => h("th", null, x)))),
+      body)),
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", onclick: load }, "Atualizar"),
+      h("button", { class: "btn primary", onclick: () => close() }, "Fechar")));
 }
 
 function groupModal(group) {
@@ -412,10 +545,11 @@ function machineModal(machine) {
   const name = h("input", { id: "m-name", value: machine ? machine.name : "", required: true, maxlength: "64", placeholder: "ex: Raspberry Pi" });
   const preset = machine ? machine.group_id : (typeof state.filter === "number" ? state.filter : null);
   const group = groupSelect(preset);
+  const shellUser = h("input", { id: "m-shell-user", value: machine ? machine.shell_user || "" : "", maxlength: "32", placeholder: "ex: thiago (vazio = como o próprio agent)", autocomplete: "off", spellcheck: "false", pattern: "[a-z_][a-z0-9_\\-]{0,31}", title: "Nome de login: minúsculas, números, _ e -" });
   const error = h("p", { class: "error", role: "alert" });
   const close = modal(h("form", { onsubmit: async (e) => {
     e.preventDefault();
-    const body = { name: name.value, group_id: group.value === "" ? null : Number(group.value) };
+    const body = { name: name.value, group_id: group.value === "" ? null : Number(group.value), shell_user: shellUser.value.trim() };
     try {
       if (machine) {
         await api("PUT", `/api/machines/${machine.id}`, body);
@@ -431,6 +565,8 @@ function machineModal(machine) {
     !machine && h("p", { class: "muted" }, "Depois de salvar, mostramos o comando para instalar o agent nela."),
     h("label", { for: "m-name" }, "Nome"), name,
     h("label", { for: "m-group" }, "Grupo"), group,
+    h("label", { for: "m-shell-user" }, "Usuário do terminal (opcional)"), shellUser,
+    h("p", { class: "muted small-note" }, "O serviço do agent roda como root e abre cada terminal e cada transferência de arquivos como este usuário da máquina, com o shell, o HOME e as permissões dele. Isso também deixa o agent atualizar a si mesmo. Vale para os comandos de instalação gerados; em uma máquina já instalada, use o comando de “Atualizar agent”."),
     error,
     h("div", { class: "modal-actions" },
       h("button", { class: "btn", type: "button", onclick: () => close() }, "Cancelar"),
@@ -1301,6 +1437,286 @@ function eventsPanel() {
     h("table", { class: "audit" },
       h("thead", null, h("tr", null, ["Quando", "Quem", "Ação", "Alvo", "Detalhe"].map((x) => h("th", null, x)))),
       body));
+}
+
+// --- live sessions (spectator) ---
+function liveView() {
+  const body = h("tbody");
+  const load = () => api("GET", "/api/sessions").then((list) => {
+    if (!list.length) {
+      body.replaceChildren(h("tr", null, h("td", { colspan: "5", class: "muted" }, "Nenhum terminal aberto agora.")));
+      return;
+    }
+    body.replaceChildren(...list.map((s) => h("tr", null,
+      h("td", null, s.username),
+      h("td", null, s.machine_name),
+      h("td", { class: "muted" }, timeAgo(s.started_at)),
+      h("td", { class: "muted" }, s.watchers ? `${s.watchers} assistindo` : "—"),
+      h("td", null, h("div", { class: "actions" }, h("button", { class: "btn small primary", onclick: () => watchSession(s) }, "Assistir"))))));
+  }).catch(fail);
+  load();
+  // The list refreshes itself until the user leaves this screen.
+  const timer = setInterval(() => { if (!body.isConnected) clearInterval(timer); else load(); }, 4000);
+  return h("div", { class: "content" }, h("main", { class: "main", style: "grid-column: 1 / -1" },
+    h("div", { class: "main-head" }, h("h2", null, "Terminais ao vivo"), h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: load }, "Atualizar")),
+    h("p", { class: "muted" }, "Assista, só leitura, a um terminal aberto agora. Você vê o que o terminal mostra, nunca o que a pessoa digita, e não consegue digitar nele. Cada visualização fica registrada em Auditoria."),
+    h("table", { class: "audit" },
+      h("thead", null, h("tr", null, ["Quem", "Máquina", "Aberto", "", ""].map((x) => h("th", null, x)))),
+      body)));
+}
+
+// watchSession shows a running terminal, read-only, in a full-screen overlay.
+async function watchSession(info) {
+  const host = h("div", { class: "term" });
+  const status = h("span", { class: "tag ok" }, "conectando…");
+  const overlay = h("div", { class: "player-overlay" },
+    h("div", { class: "term-bar" },
+      h("span", { class: "brand" }, "Ao vivo"),
+      h("span", { class: "muted" }, `${info.username} em ${info.machine_name}`),
+      status,
+      h("span", { class: "muted" }, "somente leitura"),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => close() }, "Fechar")),
+    h("div", { class: "player-host" }, host));
+  document.body.append(overlay);
+
+  await loadTerminalFonts();
+  const term = new Terminal({
+    cols: 80, rows: 24, disableStdin: true, cursorBlink: false, scrollback: 5000,
+    fontFamily: termFontFamily(), fontSize: termFontSize(),
+    theme: { background: "#1a1c2c", foreground: "#f4f4f4", cursor: "#ffcd75" },
+  });
+  term.open(host);
+  term.attachCustomKeyEventHandler(terminalKeyHandler(term)); // Ctrl+C copies the selection
+
+  let ws = null, closed = false;
+  const finish = (text, kind) => {
+    status.textContent = text;
+    status.className = "tag " + (kind || "");
+  };
+  const proto = location.protocol === "https:" ? "wss:" : "ws:";
+  ws = new WebSocket(`${proto}//${location.host}/ws/watch?session=${encodeURIComponent(info.id)}`);
+  ws.binaryType = "arraybuffer";
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") { term.write(new Uint8Array(ev.data)); return; }
+    let msg = null;
+    try { msg = JSON.parse(ev.data); } catch (_) { return; }
+    if (msg.type === "info") finish("ao vivo", "ok");
+    else if (msg.type === "resize" && msg.cols > 0 && msg.rows > 0) term.resize(msg.cols, msg.rows);
+    else if (msg.type === "end") {
+      finish(msg.reason === "session ended" ? "sessão encerrada" : msg.reason, "warn");
+      term.write("\r\n\x1b[33m[sessão encerrada]\x1b[0m\r\n");
+    }
+  };
+  ws.onclose = () => { if (!closed && status.textContent !== "sessão encerrada") finish("desconectado", "warn"); };
+  ws.onerror = () => finish("erro de conexão", "warn");
+
+  const onKey = (e) => { if (e.key === "Escape") close(); };
+  document.addEventListener("keydown", onKey);
+  function close() {
+    closed = true;
+    document.removeEventListener("keydown", onKey);
+    if (ws) ws.close();
+    term.dispose();
+    overlay.remove();
+  }
+}
+
+// --- file transfer ---
+const FILE_CHUNK = 64 * 1024;
+const joinPath = (dir, name) => (dir === "/" ? "" : dir.replace(/\/+$/, "")) + "/" + name;
+const parentPath = (p) => p.replace(/\/+$/, "").replace(/\/[^/]*$/, "") || "/";
+
+// openFiles shows a file manager for one machine. Browsing, downloads and
+// uploads travel over a WebSocket channel to the agent, one operation at a time.
+function openFiles(machine) {
+  let ws = null, closed = false, cwd = "";
+  const inbox = [];
+  let waiter = null, dead = null;
+  const push = (f) => { if (waiter) { const w = waiter; waiter = null; w(f); } else inbox.push(f); };
+  const next = () => inbox.length ? Promise.resolve(inbox.shift()) : dead ? Promise.resolve(dead) : new Promise((r) => { waiter = r; });
+
+  // connect opens the channel and resolves once the agent has joined.
+  function connect() {
+    if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve();
+    inbox.length = 0; dead = null;
+    const proto = location.protocol === "https:" ? "wss:" : "ws:";
+    ws = new WebSocket(`${proto}//${location.host}/ws/files?machine=${encodeURIComponent(machine.id)}`);
+    ws.binaryType = "arraybuffer";
+    const mine = ws;
+    return new Promise((resolve, reject) => {
+      let paired = false;
+      mine.onmessage = (ev) => {
+        if (typeof ev.data !== "string") { push({ binary: new Uint8Array(ev.data) }); return; }
+        let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
+        if (msg.type === "paired") { paired = true; resolve(); return; }
+        push({ msg });
+      };
+      mine.onclose = (ev) => {
+        if (ws !== mine) return; // a connection that was already replaced
+        dead = { closed: true, reason: ev.reason || "conexão encerrada" };
+        if (waiter) { const w = waiter; waiter = null; w(dead); }
+        if (!paired) reject(new Error(ev.reason || "não foi possível abrir o canal de arquivos"));
+      };
+      mine.onerror = () => {};
+    });
+  }
+  const sendOp = (m) => ws.send(JSON.stringify(m));
+  const fail = (frame) => { throw new Error(frame.closed ? frame.reason : frame.msg && frame.msg.error ? frame.msg.error : "resposta inesperada"); };
+
+  // Operations never overlap: each waits for the previous one.
+  let chain = Promise.resolve();
+  const serial = (fn) => { const run = chain.then(fn, fn); chain = run.catch(() => {}); return run; };
+
+  // --- layout ---
+  const pathInput = h("input", { class: "files-path", "aria-label": "Caminho", spellcheck: "false" });
+  const body = h("tbody");
+  const transfers = h("div", { class: "xfers" });
+  const picker = h("input", { type: "file", multiple: true, hidden: true });
+  const drop = h("div", { class: "files-drop" }, h("table", { class: "files-table" },
+    h("thead", null, h("tr", null, ["Nome", "Tamanho", "Modificado", ""].map((x) => h("th", null, x)))), body));
+  const overlay = h("div", { class: "player-overlay files-overlay" },
+    h("div", { class: "term-bar" },
+      h("span", { class: "brand" }, "Arquivos"), h("span", { class: "muted" }, machine.name),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => close() }, "Fechar")),
+    h("div", { class: "files-body" },
+      h("div", { class: "files-toolbar" },
+        h("button", { class: "btn small", title: "Pasta acima", "aria-label": "Pasta acima", onclick: () => go(parentPath(cwd)) }, "↑"),
+        h("button", { class: "btn small", title: "Recarregar", "aria-label": "Recarregar", onclick: () => go(cwd) }, "⟳"),
+        pathInput,
+        h("button", { class: "btn small", onclick: () => makeFolder() }, "Nova pasta"),
+        h("button", { class: "btn small primary", onclick: () => picker.click() }, "Enviar arquivos"),
+        picker),
+      h("p", { class: "muted files-hint" }, "Arraste arquivos para cá para enviá-los à pasta aberta. Os arquivos enviados pertencem ao usuário do terminal desta máquina. Cada envio e download fica registrado em Auditoria."),
+      drop),
+    transfers);
+  document.body.append(overlay);
+
+  // --- listing ---
+  async function list(path) {
+    await connect();
+    sendOp({ op: "list", path });
+    const f = await next();
+    if (!f.msg || f.msg.op !== "list") fail(f);
+    return f.msg;
+  }
+  async function go(path) {
+    try {
+      const r = await serial(() => list(path));
+      cwd = r.path; pathInput.value = cwd;
+      const rows = (r.entries || []).map((e) => {
+        const name = e.dir
+          ? h("button", { class: "linklike", onclick: () => go(joinPath(cwd, e.name)) }, "📁 " + e.name)
+          : h("span", null, "📄 " + e.name);
+        return h("tr", null,
+          h("td", null, name, e.link && h("span", { class: "muted", title: "Link simbólico" }, " →")),
+          h("td", { class: "muted mono" }, e.dir ? "" : formatSize(e.size)),
+          h("td", { class: "muted" }, e.mtime ? new Date(e.mtime * 1000).toLocaleString() : ""),
+          h("td", null, !e.dir && h("button", { class: "btn small", onclick: () => download(joinPath(cwd, e.name), e.name) }, "Baixar")));
+      });
+      body.replaceChildren(...(rows.length ? rows : [h("tr", null, h("td", { colspan: "4", class: "muted" }, "Pasta vazia."))]));
+    } catch (e) { toast(`${machine.name}: ${e.message}`, "err"); pathInput.value = cwd; }
+  }
+  pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") go(pathInput.value.trim()); });
+
+  async function makeFolder() {
+    const name = prompt("Nome da nova pasta:");
+    if (!name) return;
+    try {
+      await serial(async () => {
+        await connect();
+        sendOp({ op: "mkdir", path: joinPath(cwd, name) });
+        const f = await next();
+        if (!f.msg || f.msg.op !== "done") fail(f);
+      });
+      go(cwd);
+    } catch (e) { toast(e.message, "err"); }
+  }
+
+  // --- transfers ---
+  function transferRow(icon, name) {
+    const bar = h("div", { class: "bar-fill" });
+    const status = h("span", { class: "muted" }, "aguardando…");
+    transfers.prepend(h("div", { class: "xfer" }, h("span", null, `${icon} ${name}`), h("div", { class: "bar" }, bar), status));
+    while (transfers.children.length > 20) transfers.lastChild.remove();
+    return {
+      progress: (done, total) => { bar.style.width = total ? `${Math.min(100, (done / total) * 100)}%` : "100%"; status.textContent = `${formatSize(done)}${total ? " / " + formatSize(total) : ""}`; },
+      ok: (text) => { bar.style.width = "100%"; bar.classList.add("ok"); status.textContent = text; },
+      err: (text) => { bar.classList.add("bad"); status.textContent = text; status.className = "error-text"; },
+    };
+  }
+
+  function download(path, name) {
+    const row = transferRow("↓", name);
+    return serial(async () => {
+      try {
+        await connect();
+        sendOp({ op: "get", path });
+        let f = await next();
+        if (!f.msg || f.msg.op !== "get") fail(f);
+        const total = f.msg.size, parts = [];
+        let got = 0;
+        for (;;) {
+          f = await next();
+          if (f.binary) { parts.push(f.binary); got += f.binary.length; row.progress(got, total); continue; }
+          if (f.msg && f.msg.op === "done") break;
+          fail(f);
+        }
+        if (got !== total) throw new Error(`o arquivo mudou durante o download (${got} de ${total} bytes)`);
+        const url = URL.createObjectURL(new Blob(parts));
+        const a = h("a", { href: url, download: name });
+        document.body.append(a); a.click(); a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60000);
+        row.ok(`baixado, ${formatSize(got)}`);
+      } catch (e) { row.err(e.message); }
+    });
+  }
+
+  function upload(file) {
+    const row = transferRow("↑", file.name);
+    return serial(async () => {
+      try {
+        await connect();
+        const dest = joinPath(cwd, file.name);
+        let overwrite = false;
+        for (;;) {
+          sendOp({ op: "put", path: dest, size: file.size, overwrite });
+          const f = await next();
+          if (f.msg && f.msg.op === "ready") break;
+          if (f.msg && f.msg.op === "error" && /já existe/.test(f.msg.error) && !overwrite && confirm(`${file.name} já existe em ${cwd}. Substituir?`)) { overwrite = true; continue; }
+          fail(f);
+        }
+        for (let off = 0; off < file.size; off += FILE_CHUNK) {
+          if (dead) fail(dead);
+          while (ws.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 25));
+          ws.send(await file.slice(off, off + FILE_CHUNK).arrayBuffer());
+          row.progress(Math.min(off + FILE_CHUNK, file.size), file.size);
+        }
+        sendOp({ op: "end" });
+        const f = await next();
+        if (!f.msg || f.msg.op !== "done") fail(f);
+        row.ok(`enviado, ${formatSize(file.size)}`);
+        go(cwd);
+      } catch (e) { row.err(e.message); }
+    });
+  }
+  const uploadAll = (files) => { for (const f of files) upload(f); };
+  picker.addEventListener("change", () => { uploadAll([...picker.files]); picker.value = ""; });
+  for (const ev of ["dragenter", "dragover"]) overlay.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); });
+  overlay.addEventListener("dragleave", (e) => { if (e.target === overlay || e.target === drop) drop.classList.remove("over"); });
+  overlay.addEventListener("drop", (e) => { e.preventDefault(); drop.classList.remove("over"); uploadAll([...e.dataTransfer.files]); });
+
+  const onKey = (e) => { if (e.key === "Escape" && !document.querySelector(".overlay")) close(); };
+  document.addEventListener("keydown", onKey);
+  function close() {
+    closed = true;
+    document.removeEventListener("keydown", onKey);
+    if (ws) ws.close();
+    overlay.remove();
+  }
+  go("");
 }
 
 // --- recorded sessions ---

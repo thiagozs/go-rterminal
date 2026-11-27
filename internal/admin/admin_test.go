@@ -68,6 +68,17 @@ func newEnvWithStore(t *testing.T, tweak func(*Config, *store.Store)) *env {
 		},
 		OnAgentConnected: func(id string, info protocol.Message) {
 			_ = st.TouchMachine(id, info.Hostname, info.OS, info.Arch, info.Version)
+			_ = st.AddMachineEvents(id, "server", []store.MachineEvent{{At: time.Now(), Kind: "online"}})
+		},
+		OnAgentDisconnected: func(id, reason string) {
+			_ = st.AddMachineEvents(id, "server", []store.MachineEvent{{At: time.Now(), Kind: "offline", Detail: reason}})
+		},
+		OnAgentEvents: func(id string, events []protocol.Event) {
+			list := make([]store.MachineEvent, 0, len(events))
+			for _, ev := range events {
+				list = append(list, store.MachineEvent{At: ev.At, Kind: ev.Kind, Detail: ev.Detail})
+			}
+			_ = st.AddMachineEvents(id, "agent", list)
 		},
 		SessionTimeout: 3 * time.Second,
 		Logger:         quiet,
@@ -400,7 +411,7 @@ func TestCommandsUsePublicURL(t *testing.T) {
 	t.Parallel()
 	s := New(Config{PublicURL: "https://rt.example.com/", Logger: log.New(io.Discard, "", 0)})
 	req := httptest.NewRequest("GET", "http://ignored.local/", nil)
-	cmds := s.commands(req, "pi", "secret123")
+	cmds := s.commands(req, "pi", "secret123", "")
 	for _, want := range []string{"--server-url wss://rt.example.com ", "--agent-id pi", "RTERMINAL_TOKEN=secret123"} {
 		if !strings.Contains(cmds.Binary+" ", want) {
 			t.Errorf("binary command missing %q: %s", want, cmds.Binary)

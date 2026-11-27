@@ -31,6 +31,10 @@ services:
       # Verificacao em duas etapas: none, admins ou all. O app autenticador
       # funciona sempre; o codigo por e-mail precisa de RESEND_API_KEY (Resend)
       # ou de SMTP_HOST (ex: Mailpit para testes), nunca dos dois.
+      # Envio e download de arquivos pelo painel (admin e operadores) e o
+      # tamanho maximo de um arquivo.
+      - "--files=${FILE_TRANSFER:-true}"
+      - "--max-transfer-mb=${MAX_TRANSFER_MB:-512}"
       - "--require-2fa=${REQUIRE_2FA:-none}"
       - "--mail-from=${MAIL_FROM:-}"
       - "--smtp-host=${SMTP_HOST:-}"

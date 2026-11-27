@@ -14,6 +14,7 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
 	"runtime"
 	"sync"
 	"syscall"
@@ -24,6 +25,7 @@ import (
 	"github.com/spf13/cobra"
 	"github.com/thiagozs/go-rterminal/internal/auth"
 	"github.com/thiagozs/go-rterminal/internal/backoff"
+	"github.com/thiagozs/go-rterminal/internal/diag"
 	"github.com/thiagozs/go-rterminal/internal/endpoint"
 	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/tlsutil"
@@ -43,6 +45,7 @@ const (
 func main() {
 	rootCmd := &cobra.Command{
 		Use:           "agent",
+		Version:       version,
 		Short:         "Conecta um agente ao servidor do go-rterminal",
 		SilenceUsage:  true,
 		SilenceErrors: true,
@@ -58,6 +61,10 @@ func main() {
 	rootCmd.Flags().Duration("backoff-min", 5*time.Second, "Backoff minimo para reconexao")
 	rootCmd.Flags().Duration("backoff-max", 60*time.Second, "Backoff maximo para reconexao")
 	rootCmd.Flags().Duration("keepalive-interval", 15*time.Second, "Intervalo de keepalive no controle")
+	rootCmd.Flags().String("shell-user", "", "Abre os terminais e a transferencia de arquivos como este usuario (o agent roda como root e troca de usuario por sessao; o shell padrao passa a ser o dele)")
+	rootCmd.Flags().Bool("no-files", false, "Desativa a transferencia de arquivos pelo painel")
+	rootCmd.Flags().Bool("no-self-update", false, "Recusa o pedido de atualizacao automatica vindo do painel")
+	rootCmd.Flags().String("events-file", "", "Arquivo do diario de eventos de conexao (padrao: /var/lib/rterminal-agent/events.jsonl como root, ou ~/.local/state/rterminal-agent/events.jsonl; \"off\" desativa)")
 	cobra.CheckErr(rootCmd.Execute())
 }
 
@@ -75,6 +82,27 @@ type agentConfig struct {
 	sessionSlots      semaphore // active shells; nil = unlimited
 	pendingSlots      semaphore // sessions waiting for a peer; nil = unlimited
 	sessions          *sync.WaitGroup
+	journal           *diag.Journal // connection history; nil records nothing
+	onConnected       func()        // called each time the control channel is registered
+	noSelfUpdate      bool          // refuse update requests from the panel
+	noFiles           bool          // refuse file transfer channels
+	identity          *identity     // account terminals and files run as; nil = the agent's own
+	supervised        bool          // run by systemd, which restarts the agent when it exits
+	updater           *updater
+}
+
+// defaultEventsFile is where the connection journal lives when not configured.
+func defaultEventsFile() string {
+	if os.Geteuid() == 0 {
+		return "/var/lib/rterminal-agent/events.jsonl"
+	}
+	if dir := os.Getenv("XDG_STATE_HOME"); dir != "" {
+		return filepath.Join(dir, "rterminal-agent", "events.jsonl")
+	}
+	if home, err := os.UserHomeDir(); err == nil {
+		return filepath.Join(home, ".local", "state", "rterminal-agent", "events.jsonl")
+	}
+	return ""
 }
 
 func runAgent(cmd *cobra.Command, _ []string) error {
@@ -89,6 +117,19 @@ func runAgent(cmd *cobra.Command, _ []string) error {
 	config.backoffMin, _ = cmd.Flags().GetDuration("backoff-min")
 	config.backoffMax, _ = cmd.Flags().GetDuration("backoff-max")
 	config.keepaliveInterval, _ = cmd.Flags().GetDuration("keepalive-interval")
+	eventsFile, _ := cmd.Flags().GetString("events-file")
+	config.noSelfUpdate, _ = cmd.Flags().GetBool("no-self-update")
+	config.noFiles, _ = cmd.Flags().GetBool("no-files")
+	shellUser, _ := cmd.Flags().GetString("shell-user")
+	identity, err := resolveShellUser(shellUser)
+	if err != nil {
+		return err
+	}
+	config.identity = identity
+	if identity != nil && !cmd.Flags().Changed("shell") && identity.shell != "" {
+		config.shellPath = identity.shell // the account's own login shell
+	}
+	config.supervised = os.Getenv("INVOCATION_ID") != "" // set by systemd for the services it runs
 	if err := config.validate(); err != nil {
 		return err
 	}
@@ -106,6 +147,48 @@ func runAgent(cmd *cobra.Command, _ []string) error {
 	defer stop()
 	config.sessions = &sync.WaitGroup{}
 
+	switch eventsFile {
+	case "off":
+		eventsFile = ""
+	case "":
+		eventsFile = defaultEventsFile()
+	}
+	journal := diag.Open(eventsFile)
+	config.journal = journal
+	if exe, err := executablePath(); err == nil {
+		config.updater = &updater{exe: exe, journal: journal, exit: os.Exit}
+		config.updater.begin()
+	}
+	var noUpdate error = errors.New("não foi possível localizar o binário do agent")
+	if config.updater != nil {
+		noUpdate = config.updater.unavailable(config)
+	}
+	recordStart(journal, noUpdate, config.identity)
+	go diag.WatchSuspend(ctx, journal)
+
+	// link follows the connection so a reconnection can say how long the
+	// agent was offline and how many attempts it took.
+	var link struct {
+		connectedAt time.Time
+		offlineAt   time.Time
+		attempts    int
+		firstErr    string
+	}
+	config.onConnected = func() {
+		detail := "conectado ao servidor"
+		if !link.offlineAt.IsZero() {
+			detail = fmt.Sprintf("reconectado depois de %s offline, em %d tentativa(s)", time.Since(link.offlineAt).Round(time.Second), link.attempts)
+			if link.firstErr != "" {
+				detail += "; causa: " + link.firstErr
+			}
+		}
+		journal.Record("connected", detail)
+		if config.updater != nil {
+			config.updater.confirm()
+		}
+		link.connectedAt, link.offlineAt, link.attempts, link.firstErr = time.Now(), time.Time{}, 0, ""
+	}
+
 	rng := rand.New(rand.NewSource(time.Now().UnixNano()))
 	retry := backoff.New(config.backoffMin, config.backoffMax, rng)
 	for ctx.Err() == nil {
@@ -116,6 +199,20 @@ func runAgent(cmd *cobra.Command, _ []string) error {
 		}
 		if connected {
 			retry.Reset()
+			journal.Record("lost", fmt.Sprintf("conexão perdida depois de %s: %s | %s",
+				time.Since(link.connectedAt).Round(time.Second), diag.Describe(err), diag.NetSnapshot()))
+			link.offlineAt, link.attempts, link.firstErr = time.Now(), 0, ""
+		} else {
+			link.attempts++
+			if link.offlineAt.IsZero() {
+				link.offlineAt = time.Now()
+			}
+			// Only the first failure of an outage is recorded in full; the
+			// reconnection event summarises the rest.
+			if link.attempts == 1 {
+				link.firstErr = diag.Describe(err)
+				journal.Record("connect_failed", link.firstErr+" | "+diag.NetSnapshot())
+			}
 		}
 		log.Printf("[agent] conexão perdida: %v", err)
 		delay := retry.Next()
@@ -125,9 +222,42 @@ func runAgent(cmd *cobra.Command, _ []string) error {
 		case <-ctx.Done():
 		}
 	}
+	journal.Record("agent_stop", "agent encerrado normalmente (sinal de parada)")
 	log.Println("[agent] encerrando, aguardando sessões ativas")
 	config.sessions.Wait()
 	return nil
+}
+
+// recordStart notes that the agent started and whether the previous run ended
+// cleanly, which tells a reboot or power loss apart from a normal restart.
+func recordStart(j *diag.Journal, noUpdate error, id *identity) {
+	detail := "agent " + version + " iniciado"
+	if id != nil {
+		detail += fmt.Sprintf("; terminais e arquivos abrem como o usuário %s (uid %d)", id.name, id.uid)
+		log.Printf("[agent] terminais e arquivos abrem como o usuário %s (uid %d), shell %s", id.name, id.uid, id.shell)
+	}
+	if noUpdate != nil {
+		detail += "; atualização automática indisponível: " + noUpdate.Error()
+	}
+	if up := diag.Uptime(); up > 0 {
+		detail += fmt.Sprintf("; a máquina está ligada há %s", up.Round(time.Second))
+	}
+	if clean, known := j.PreviousRunEndedCleanly(); known && !clean {
+		detail += "; a execução anterior não terminou normalmente (queda de energia, reinício forçado ou falha do agent)"
+	}
+	j.Record("agent_start", detail)
+}
+
+// capabilities lists what this agent offers the server.
+func (c agentConfig) capabilities() []string {
+	var caps []string
+	if c.updater != nil && c.updater.unavailable(c) == nil {
+		caps = append(caps, protocol.CapSelfUpdate)
+	}
+	if !c.noFiles && (c.identity == nil || fileIdentitySupported) {
+		caps = append(caps, protocol.CapFiles)
+	}
+	return caps
 }
 
 func (c agentConfig) validate() error {
@@ -160,27 +290,32 @@ func runControl(ctx context.Context, config agentConfig) (bool, error) {
 	}
 	headers := http.Header{}
 	auth.SetAuthorization(headers, config.authToken)
-	ctrl, _, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).DialContext(ctx, controlURL, headers)
+	ctrl, resp, err := (&websocket.Dialer{TLSClientConfig: tlsConfig}).DialContext(ctx, controlURL, headers)
 	if err != nil {
-		return false, err
+		return false, diag.NewDialError(err, resp)
 	}
 	defer ctrl.Close()
 
 	hostname, _ := os.Hostname()
 	if err := ctrl.WriteJSON(protocol.Message{
-		Type:      protocol.TypeRegisterAgent,
-		AgentID:   config.agentID,
-		SessionID: config.agentID, // Compatibilidade com servidores anteriores.
-		Hostname:  hostname,
-		OS:        runtime.GOOS,
-		Arch:      runtime.GOARCH,
-		Version:   version,
+		Type:         protocol.TypeRegisterAgent,
+		AgentID:      config.agentID,
+		SessionID:    config.agentID, // Compatibilidade com servidores anteriores.
+		Hostname:     hostname,
+		OS:           runtime.GOOS,
+		Arch:         runtime.GOARCH,
+		Version:      version,
+		Capabilities: config.capabilities(),
 	}); err != nil {
 		return false, fmt.Errorf("registrar agente: %w", err)
 	}
 	connected := true
 	ctrl.SetReadLimit(1 << 20)
 	log.Printf("[agent] conectado | agent=%s", config.agentID)
+	if config.onConnected != nil {
+		config.onConnected()
+	}
+	sendDiagnostics(ctrl, config.journal)
 
 	keepaliveDone := startKeepalive(ctrl, config.keepaliveInterval)
 	defer close(keepaliveDone)
@@ -197,8 +332,30 @@ func runControl(ctx context.Context, config agentConfig) (bool, error) {
 		if err := ctrl.ReadJSON(&msg); err != nil {
 			return connected, err
 		}
+		if msg.Type == protocol.TypeUpdateAgent {
+			if config.updater != nil {
+				go config.updater.run(ctx, config, msg, func() { sendDiagnostics(ctrl, config.journal) })
+			}
+			continue
+		}
 		if msg.Type != protocol.TypeStartSession || msg.SessionID == "" {
 			log.Printf("[agent] mensagem de controle ignorada | type=%q", msg.Type)
+			continue
+		}
+		if msg.Kind == protocol.KindFiles {
+			if config.noFiles {
+				log.Printf("[agent] transferência de arquivos desativada, pedido recusado | session=%s", msg.SessionID)
+				continue
+			}
+			if !config.pendingSlots.tryAcquire() {
+				log.Printf("[agent] muitas sessões aguardando pareamento, canal de arquivos recusado | session=%s", msg.SessionID)
+				continue
+			}
+			config.sessions.Add(1)
+			go func(sessionID string) {
+				defer config.sessions.Done()
+				runFileSession(ctx, config, sessionID)
+			}(msg.SessionID)
 			continue
 		}
 		log.Printf("[agent] iniciando sessão | session=%s", msg.SessionID)
@@ -211,6 +368,24 @@ func runControl(ctx context.Context, config agentConfig) (bool, error) {
 			defer config.sessions.Done()
 			runShellSession(ctx, config, sessionID, tlsConfig)
 		}(msg.SessionID)
+	}
+}
+
+// sendDiagnostics hands the server the events recorded since the last
+// delivery. Events that could not be sent stay queued for the next connection.
+func sendDiagnostics(ctrl *websocket.Conn, j *diag.Journal) {
+	for {
+		batch := j.Take(diag.BatchSize)
+		if len(batch) == 0 {
+			return
+		}
+		_ = ctrl.SetWriteDeadline(time.Now().Add(10 * time.Second))
+		err := ctrl.WriteJSON(protocol.Message{Type: protocol.TypeDiagnostics, Events: batch})
+		_ = ctrl.SetWriteDeadline(time.Time{})
+		if err != nil {
+			j.Requeue(batch)
+			return
+		}
 	}
 }
 
@@ -240,6 +415,34 @@ func startKeepalive(conn *websocket.Conn, interval time.Duration) chan struct{} 
 		}
 	}()
 	return done
+}
+
+// startShell starts command on a new PTY. With an identity the shell is
+// started as that account (uid, gid and groups), and the PTY slave is handed
+// to it so programs that open /dev/pts/N by name keep working.
+func startShell(command *exec.Cmd, id *identity) (*os.File, error) {
+	if id == nil {
+		return pty.Start(command)
+	}
+	ptmx, tty, err := pty.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer tty.Close()
+	if err := os.Chown(tty.Name(), int(id.uid), -1); err != nil {
+		ptmx.Close()
+		return nil, fmt.Errorf("entregar o terminal ao usuário %s: %w", id.name, err)
+	}
+	command.Stdin, command.Stdout, command.Stderr = tty, tty, tty
+	command.SysProcAttr = &syscall.SysProcAttr{
+		Setsid: true, Setctty: true,
+		Credential: &syscall.Credential{Uid: id.uid, Gid: id.gid, Groups: id.groups},
+	}
+	if err := command.Start(); err != nil {
+		ptmx.Close()
+		return nil, err
+	}
+	return ptmx, nil
 }
 
 func runShellSession(ctx context.Context, config agentConfig, sessionID string, tlsConfig *tls.Config) {
@@ -288,9 +491,9 @@ func shellSession(ctx context.Context, config agentConfig, sessionID string, tls
 	defer config.sessionSlots.release()
 
 	command := exec.Command(config.shellPath)
-	command.Env = shellEnvironment(os.Environ(), config.shellPath)
+	command.Env = sessionEnvironment(os.Environ(), config.shellPath, config.identity)
 	command.Dir = startDirectory(command.Env)
-	ptmx, err := pty.Start(command)
+	ptmx, err := startShell(command, config.identity)
 	if err != nil {
 		return fmt.Errorf("iniciar PTY: %w", err)
 	}

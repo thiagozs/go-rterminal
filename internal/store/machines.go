@@ -3,6 +3,7 @@ package store
 import (
 	"database/sql"
 	"errors"
+	"regexp"
 	"strings"
 	"time"
 )
@@ -17,9 +18,13 @@ type Machine struct {
 	OS        string     `json:"os"`
 	Arch      string     `json:"arch"`
 	Version   string     `json:"version"`
+	// ShellUser is the account the agent opens terminals and file transfers
+	// as (--shell-user). Empty means the agent's own. It only shapes the
+	// install commands the panel generates.
+	ShellUser string `json:"shell_user"`
 }
 
-const machineColumns = `id, name, group_id, created_at, last_seen, hostname, os, arch, version`
+const machineColumns = `id, name, group_id, created_at, last_seen, hostname, os, arch, version, shell_user`
 
 type scanner interface{ Scan(dest ...any) error }
 
@@ -27,7 +32,7 @@ func scanMachine(r scanner) (*Machine, error) {
 	var m Machine
 	var group, lastSeen sql.NullInt64
 	var created int64
-	if err := r.Scan(&m.ID, &m.Name, &group, &created, &lastSeen, &m.Hostname, &m.OS, &m.Arch, &m.Version); err != nil {
+	if err := r.Scan(&m.ID, &m.Name, &group, &created, &lastSeen, &m.Hostname, &m.OS, &m.Arch, &m.Version, &m.ShellUser); err != nil {
 		return nil, err
 	}
 	m.CreatedAt = fromUnix(created)
@@ -40,6 +45,30 @@ func scanMachine(r scanner) (*Machine, error) {
 		m.LastSeen = &t
 	}
 	return &m, nil
+}
+
+// shellUserName matches portable POSIX account names, which is also what makes
+// the value safe to put into the generated shell commands and systemd unit.
+var shellUserName = regexp.MustCompile(`^[a-z_][a-z0-9_-]{0,31}$`)
+
+// ValidShellUser reports whether name can be used as a shell user ("" is valid: none).
+func ValidShellUser(name string) bool {
+	name = strings.TrimSpace(name)
+	return name == "" || shellUserName.MatchString(name)
+}
+
+// SetMachineShellUser records which account the agent of a machine opens
+// terminals as ("" clears it).
+func (s *Store) SetMachineShellUser(id, shellUser string) error {
+	shellUser = strings.TrimSpace(shellUser)
+	if !ValidShellUser(shellUser) {
+		return ErrInvalid
+	}
+	res, err := s.db.Exec(`UPDATE machines SET shell_user = ? WHERE id = ?`, shellUser, id)
+	if err != nil {
+		return err
+	}
+	return affected(res)
 }
 
 // CreateMachine registers a machine and returns its credential. The credential

@@ -4,8 +4,10 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 
+	"github.com/thiagozs/go-rterminal/internal/protocol"
 	"github.com/thiagozs/go-rterminal/internal/store"
 )
 
@@ -25,6 +27,11 @@ type Commands struct {
 type machineView struct {
 	store.Machine
 	Online bool `json:"online"`
+	// CanSelfUpdate is true when the connected agent can replace itself on
+	// request (older agents cannot and need the manual command once).
+	CanSelfUpdate bool `json:"can_self_update"`
+	// CanFiles is true when the connected agent serves file transfer.
+	CanFiles bool `json:"can_files"`
 }
 
 type machineCreated struct {
@@ -36,10 +43,18 @@ type machineCreated struct {
 type machineInput struct {
 	Name    string `json:"name"`
 	GroupID *int64 `json:"group_id"`
+	// ShellUser is the account terminals and file transfers open as. Absent
+	// leaves it unchanged; "" clears it.
+	ShellUser *string `json:"shell_user"`
 }
 
 func (s *Server) view(m store.Machine) machineView {
-	return machineView{Machine: m, Online: s.relay.IsOnline(m.ID)}
+	online := s.relay.IsOnline(m.ID)
+	return machineView{
+		Machine: m, Online: online,
+		CanSelfUpdate: online && s.relay.AgentHas(m.ID, protocol.CapSelfUpdate),
+		CanFiles:      online && s.files && s.relay.AgentHas(m.ID, protocol.CapFiles),
+	}
 }
 
 func (s *Server) listMachines(w http.ResponseWriter, _ *http.Request, admin *store.Admin) {
@@ -69,14 +84,25 @@ func (s *Server) createMachine(w http.ResponseWriter, r *http.Request, admin *st
 	if !decode(w, r, &in) {
 		return
 	}
+	if in.ShellUser != nil && !store.ValidShellUser(*in.ShellUser) {
+		writeError(w, http.StatusBadRequest, "invalid shell user: use a login name such as thiago")
+		return
+	}
 	machine, credential, err := s.store.CreateMachine(in.Name, in.GroupID)
 	if err != nil {
 		s.storeError(w, err)
 		return
 	}
+	if in.ShellUser != nil && *in.ShellUser != "" {
+		if err := s.store.SetMachineShellUser(machine.ID, *in.ShellUser); err != nil {
+			s.storeError(w, err)
+			return
+		}
+		machine.ShellUser = strings.TrimSpace(*in.ShellUser)
+	}
 	s.audit(admin.Username, "machine_create", machine.ID, "")
 	writeJSON(w, http.StatusCreated, machineCreated{
-		Machine: s.view(*machine), Credential: credential, Commands: s.commands(r, machine.ID, credential),
+		Machine: s.view(*machine), Credential: credential, Commands: s.commands(r, machine.ID, credential, machine.ShellUser),
 	})
 }
 
@@ -89,6 +115,12 @@ func (s *Server) updateMachine(w http.ResponseWriter, r *http.Request, admin *st
 	if err := s.store.UpdateMachine(id, in.Name, in.GroupID); err != nil {
 		s.storeError(w, err)
 		return
+	}
+	if in.ShellUser != nil {
+		if err := s.store.SetMachineShellUser(id, *in.ShellUser); err != nil {
+			s.storeError(w, err)
+			return
+		}
 	}
 	machine, err := s.store.GetMachine(id)
 	if err != nil {
@@ -127,7 +159,7 @@ func (s *Server) rotateMachine(w http.ResponseWriter, r *http.Request, admin *st
 	s.relay.Disconnect(id, "credential rotated")
 	s.audit(admin.Username, "machine_rotate", id, "")
 	writeJSON(w, http.StatusOK, machineCreated{
-		Machine: s.view(*machine), Credential: credential, Commands: s.commands(r, id, credential),
+		Machine: s.view(*machine), Credential: credential, Commands: s.commands(r, id, credential, machine.ShellUser),
 	})
 }
 
@@ -151,7 +183,7 @@ const archDetect = `case "$(uname -m)" in
   *) echo "arquitetura nao suportada: $(uname -m)" >&2; exit 1 ;;
 esac`
 
-func (s *Server) commands(r *http.Request, machineID, credential string) Commands {
+func (s *Server) commands(r *http.Request, machineID, credential, shellUser string) Commands {
 	base := s.baseURL(r)
 	wsURL := base
 	if u, err := url.Parse(base); err == nil {
@@ -164,6 +196,12 @@ func (s *Server) commands(r *http.Request, machineID, credential string) Command
 		wsURL = u.String()
 	}
 	args := fmt.Sprintf("--server-url %s --agent-id %s", wsURL, machineID)
+	// The service runs as root and opens terminals and file transfers as this
+	// account, which is what also lets the agent replace its own binary.
+	unitArgs := args
+	if shellUser != "" {
+		unitArgs += " --shell-user " + shellUser
+	}
 	unit := strings.Join([]string{
 		"sudo tee /etc/systemd/system/rterminal-agent.service >/dev/null <<'EOF'",
 		"[Unit]",
@@ -173,7 +211,7 @@ func (s *Server) commands(r *http.Request, machineID, credential string) Command
 		"",
 		"[Service]",
 		"EnvironmentFile=/etc/rterminal-agent.env",
-		"ExecStart=/usr/local/bin/agent " + args,
+		"ExecStart=/usr/local/bin/agent " + unitArgs,
 		"Restart=always",
 		"RestartSec=5",
 		"",
@@ -224,4 +262,21 @@ func (s *Server) commands(r *http.Request, machineID, credential string) Command
 			fmt.Sprintf(`RTERMINAL_TOKEN="$TOKEN" ./agent %s`, args),
 		}, "\n"),
 	}
+}
+
+// machineEvents returns the connection history of a machine: what the agent
+// noticed (suspension, network loss, ...) and what the server observed.
+func (s *Server) machineEvents(w http.ResponseWriter, r *http.Request, _ *store.Admin) {
+	machine, err := s.store.GetMachine(r.PathValue("id"))
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	limit, _ := strconv.Atoi(r.URL.Query().Get("limit"))
+	events, err := s.store.ListMachineEvents(machine.ID, limit)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	writeJSON(w, http.StatusOK, events)
 }

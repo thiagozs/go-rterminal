@@ -55,6 +55,8 @@ func main() {
 	rootCmd.Flags().String("recordings-dir", "", "Pasta das gravacoes (padrao: a pasta \"recordings\" ao lado do --db)")
 	rootCmd.Flags().Int("recordings-max-mb", 50, "Tamanho maximo de uma gravacao; a sessao e cortada com um aviso ao passar")
 	rootCmd.Flags().Int("recordings-retention-days", 90, "Apaga gravacoes mais antigas que isso (0 = guarda para sempre)")
+	rootCmd.Flags().Bool("files", true, "Permite enviar e baixar arquivos das maquinas pelo painel (so com --db)")
+	rootCmd.Flags().Int("max-transfer-mb", 512, "Tamanho maximo de um arquivo enviado ou baixado pelo painel")
 	rootCmd.Flags().String("require-2fa", "none", "Exige verificacao em duas etapas: none, admins ou all (quem nao tem fica so na tela de configuracao)")
 	rootCmd.Flags().String("2fa-issuer", "go-rterminal", "Nome que aparece no app autenticador")
 	rootCmd.Flags().String("resend-api-key", "", "Chave da API do Resend para o PIN por e-mail (prefira RTERMINAL_RESEND_API_KEY, que nao aparece no ps)")
@@ -101,6 +103,11 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	adminUser, _ := cmd.Flags().GetString("admin-user")
 	agentsDir, _ := cmd.Flags().GetString("agents-dir")
 	proxyCIDRs, _ := cmd.Flags().GetStringSlice("trusted-proxies")
+	fileTransfer, _ := cmd.Flags().GetBool("files")
+	maxTransferMB, _ := cmd.Flags().GetInt("max-transfer-mb")
+	if maxTransferMB < 1 {
+		return fmt.Errorf("max-transfer-mb deve ser >= 1")
+	}
 	recordSessions, _ := cmd.Flags().GetBool("recordings")
 	recordingsDir, _ := cmd.Flags().GetString("recordings-dir")
 	recordingsMaxMB, _ := cmd.Flags().GetInt("recordings-max-mb")
@@ -171,9 +178,27 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			}
 			return machine.ID, true
 		}
+		recordEvent := func(id, source, kind, detail string) {
+			if err := st.AddMachineEvents(id, source, []store.MachineEvent{{At: time.Now(), Kind: kind, Detail: detail}}); err != nil {
+				log.Printf("[server] falha ao registrar evento | agent=%s err=%v", id, err)
+			}
+		}
 		relayConfig.OnAgentConnected = func(id string, info protocol.Message) {
 			if err := st.TouchMachine(id, info.Hostname, info.OS, info.Arch, info.Version); err != nil {
 				log.Printf("[server] falha ao registrar conexão | agent=%s err=%v", id, err)
+			}
+			recordEvent(id, "server", "online", "agent conectou (versão "+info.Version+")")
+		}
+		relayConfig.OnAgentDisconnected = func(id, reason string) {
+			recordEvent(id, "server", "offline", reason)
+		}
+		relayConfig.OnAgentEvents = func(id string, events []protocol.Event) {
+			list := make([]store.MachineEvent, 0, len(events))
+			for _, e := range events {
+				list = append(list, store.MachineEvent{At: e.At, Kind: e.Kind, Detail: e.Detail})
+			}
+			if err := st.AddMachineEvents(id, "agent", list); err != nil {
+				log.Printf("[server] falha ao guardar eventos do agent | agent=%s err=%v", id, err)
 			}
 		}
 		sealer, err := twofactor.LoadSealer(filepath.Join(filepath.Dir(dbPath), "2fa.key"))
@@ -204,7 +229,7 @@ func runServer(cmd *cobra.Command, _ []string) error {
 			log.Printf("[server] gravação de sessões desativada")
 		}
 		relayServer := relay.New(relayConfig)
-		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version, Recordings: recordings,
+		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version, Recordings: recordings, DisableFiles: !fileTransfer, MaxTransferBytes: int64(maxTransferMB) << 20,
 			Sealer: sealer, Mailer: mailSender, Require2FA: require2FA, Issuer: issuer})
 		logAgentDownloads(agentsDir)
 

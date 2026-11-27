@@ -77,6 +77,15 @@ CREATE TABLE IF NOT EXISTS machines (
 	arch TEXT NOT NULL DEFAULT '',
 	version TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS machine_events (
+	id INTEGER PRIMARY KEY AUTOINCREMENT,
+	machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
+	at INTEGER NOT NULL,
+	source TEXT NOT NULL,
+	kind TEXT NOT NULL,
+	detail TEXT NOT NULL DEFAULT ''
+);
+CREATE INDEX IF NOT EXISTS machine_events_machine ON machine_events(machine_id, at);
 CREATE TABLE IF NOT EXISTS recordings (
 	id TEXT PRIMARY KEY,
 	machine_id TEXT NOT NULL,
@@ -123,6 +132,9 @@ func Open(path string) (*Store, error) {
 
 // migrate upgrades databases created by earlier versions.
 func migrate(db *sql.DB) error {
+	if err := addColumnIfMissing(db, "machines", "shell_user", "TEXT NOT NULL DEFAULT ''"); err != nil {
+		return err
+	}
 	if err := addColumnIfMissing(db, "admins", "must_change_password", "INTEGER NOT NULL DEFAULT 0"); err != nil {
 		return err
 	}

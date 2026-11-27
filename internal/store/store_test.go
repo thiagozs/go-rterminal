@@ -4,6 +4,7 @@ import (
 	"database/sql"
 	"errors"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -430,6 +431,118 @@ func TestMigrationAddsTwoFactorColumnsToOlderDatabases(t *testing.T) {
 		t.Fatalf("legacy = %+v, %v", u, err)
 	}
 	if err := s.EnableTOTP(u.ID, "x", 1); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestMachineEvents(t *testing.T) {
+	st := newTestStore(t)
+	m, _, err := st.CreateMachine("pi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	old := time.Now().Add(-40 * 24 * time.Hour)
+	future := time.Now().Add(48 * time.Hour)
+	if err := st.AddMachineEvents(m.ID, "agent", []MachineEvent{
+		{At: old, Kind: "lost", Detail: "muito antigo"},
+		{At: time.Now().Add(-time.Hour), Kind: "suspend", Detail: "dormiu"},
+		{At: future, Kind: "clock", Detail: "relógio errado"},
+	}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := st.ListMachineEvents(m.ID, 10)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 2 || got[0].Kind != "clock" || got[1].Kind != "suspend" {
+		t.Fatalf("events = %+v (the 40-day-old one must be pruned)", got)
+	}
+	if got[0].At.After(time.Now().Add(time.Second)) {
+		t.Errorf("a future timestamp must be clamped to now: %v", got[0].At)
+	}
+
+	// The history is capped per machine.
+	var many []MachineEvent
+	for i := 0; i < maxMachineEvents+50; i++ {
+		many = append(many, MachineEvent{At: time.Now(), Kind: "k"})
+	}
+	if err := st.AddMachineEvents(m.ID, "server", many); err != nil {
+		t.Fatal(err)
+	}
+	all, _ := st.ListMachineEvents(m.ID, maxMachineEvents)
+	if len(all) != maxMachineEvents {
+		t.Fatalf("kept %d, want %d", len(all), maxMachineEvents)
+	}
+
+	// Events go away with the machine.
+	if err := st.DeleteMachine(m.ID); err != nil {
+		t.Fatal(err)
+	}
+	if left, _ := st.ListMachineEvents(m.ID, 10); len(left) != 0 {
+		t.Fatalf("events outlived the machine: %d", len(left))
+	}
+}
+
+func TestMachineShellUser(t *testing.T) {
+	s := newTestStore(t)
+	m, _, err := s.CreateMachine("pi", nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.ShellUser != "" {
+		t.Fatalf("new machine has shell user %q", m.ShellUser)
+	}
+	if err := s.SetMachineShellUser(m.ID, " thiago "); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetMachine(m.ID); got.ShellUser != "thiago" {
+		t.Fatalf("shell user = %q", got.ShellUser)
+	}
+	for _, bad := range []string{"Thiago", "root; reboot", "$(id)", "a b", "-x", "1abc", strings.Repeat("a", 40), "../etc"} {
+		if ValidShellUser(bad) || !errors.Is(s.SetMachineShellUser(m.ID, bad), ErrInvalid) {
+			t.Errorf("%q accepted as a shell user", bad)
+		}
+	}
+	for _, ok := range []string{"", "thiago", "_svc", "dev-ops", "user_1"} {
+		if !ValidShellUser(ok) {
+			t.Errorf("%q rejected", ok)
+		}
+	}
+	if err := s.SetMachineShellUser(m.ID, ""); err != nil {
+		t.Fatal(err)
+	}
+	if got, _ := s.GetMachine(m.ID); got.ShellUser != "" {
+		t.Fatalf("not cleared: %q", got.ShellUser)
+	}
+	if err := s.SetMachineShellUser("nope", "thiago"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown machine = %v", err)
+	}
+}
+
+func TestOpenMigratesMachinesWithoutShellUser(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	raw, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := raw.Exec(`CREATE TABLE machines (
+		id TEXT PRIMARY KEY, name TEXT NOT NULL, group_id INTEGER, token_hash TEXT NOT NULL UNIQUE,
+		created_at INTEGER NOT NULL, last_seen INTEGER, hostname TEXT NOT NULL DEFAULT '',
+		os TEXT NOT NULL DEFAULT '', arch TEXT NOT NULL DEFAULT '', version TEXT NOT NULL DEFAULT '');
+		INSERT INTO machines(id, name, token_hash, created_at) VALUES('old', 'Old', 'h', 1);`); err != nil {
+		t.Fatal(err)
+	}
+	raw.Close()
+	s, err := Open(path)
+	if err != nil {
+		t.Fatalf("open: %v", err)
+	}
+	defer s.Close()
+	got, err := s.GetMachine("old")
+	if err != nil || got.ShellUser != "" {
+		t.Fatalf("migrated machine = %+v, %v", got, err)
+	}
+	if err := s.SetMachineShellUser("old", "thiago"); err != nil {
 		t.Fatal(err)
 	}
 }

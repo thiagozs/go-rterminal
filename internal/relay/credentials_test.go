@@ -40,7 +40,7 @@ func newCredentialServer(t *testing.T, hooks *hookLog) (*Server, *httptest.Serve
 			hooks.info = info
 			hooks.mu.Unlock()
 		},
-		OnAgentDisconnected: func(id string) {
+		OnAgentDisconnected: func(id, _ string) {
 			hooks.mu.Lock()
 			hooks.disconnected = append(hooks.disconnected, id)
 			hooks.mu.Unlock()
