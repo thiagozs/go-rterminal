@@ -62,7 +62,7 @@ func (s *Server) downloadAgent(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if who == "" {
-		if admin, ok := s.adminFromCookie(r); ok && !admin.MustChangePassword {
+		if admin, ok := s.adminFromCookie(r); ok && admin.IsAdmin() && !admin.MustChangePassword {
 			who = "admin:" + admin.Username
 		}
 	}

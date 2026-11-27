@@ -22,10 +22,13 @@ const MIN_PASSWORD = 8;
 
 const state = {
   user: null,
+  role: "admin",     // admin (everything) | operator (terminals of their groups only)
   mustChange: false, // temporary password: only the password screen is usable
   serverVersion: "", // build of this server; agents on another build are flagged
   downloads: false,  // server ships agent binaries (enables the update command)
-  view: "machines", // machines | audit
+  recording: false,  // server records web terminal sessions (audit > recorded sessions)
+  auditTab: "events", // events | recordings
+  view: "machines", // machines | users | audit
   groups: [],
   machines: [],
   filter: "all", // all | none | <group id>
@@ -71,6 +74,7 @@ function timeAgo(iso) {
   return `há ${Math.floor(s / 86400)} d`;
 }
 
+const isAdmin = () => state.role === "admin";
 const groupName = (id) => (state.groups.find((g) => g.id === id) || {}).name || "";
 
 async function copy(text, button) {
@@ -118,9 +122,12 @@ function loginView() {
     try {
       const me = await api("POST", "/api/login", { username: user.value, password: pass.value });
       state.user = me.username;
+      state.role = me.role || "admin";
+      state.view = "machines";
       state.mustChange = !!me.must_change_password;
       state.serverVersion = me.server_version || "";
       state.downloads = !!me.agent_downloads;
+      state.recording = !!me.recording;
       if (!state.mustChange) { await refresh(); startPolling(); }
       render();
     } catch (err) { error.textContent = err.message; }
@@ -143,14 +150,14 @@ function shell() {
   return h("div", { class: "shell" },
     h("header", { class: "topbar" },
       h("span", { class: "brand" }, "GO-RTERMINAL"),
-      h("nav", { class: "nav" }, navBtn("machines", "Máquinas"), navBtn("audit", "Auditoria")),
+      h("nav", { class: "nav" }, navBtn("machines", "Máquinas"), isAdmin() && navBtn("users", "Usuários"), isAdmin() && navBtn("audit", "Auditoria")),
       h("span", { class: "spacer" }),
       workspace && h("button", { class: "btn small primary", title: "Voltar aos terminais abertos", onclick: () => workspace.show() }, `Terminais (${workspace.count()})`),
       h("span", { class: "muted" }, state.user),
       h("button", { class: "btn small", onclick: () => passwordModal() }, "Alterar senha"),
       h("button", { class: "btn small", onclick: logout }, "Sair"),
     ),
-    state.view === "machines" ? machinesView() : auditView(),
+    state.view === "users" && isAdmin() ? usersView() : state.view === "audit" && isAdmin() ? auditView() : machinesView(),
   );
 }
 
@@ -231,13 +238,13 @@ function machinesView() {
     h("span", { class: "count", title: "online / total" }, `${online(list)}/${list.length}`),
   );
   const sidebar = h("aside", { class: "sidebar" },
-    h("h3", null, "Grupos", h("button", { class: "btn small", onclick: () => groupModal() }, "+ Novo")),
+    h("h3", null, "Grupos", isAdmin() && h("button", { class: "btn small", onclick: () => groupModal() }, "+ Novo")),
     item("all", "Todas", state.machines),
     ...state.groups.map((g) => item(g.id, g.name, state.machines.filter((m) => m.group_id === g.id),
-      h("span", { class: "group-tools" },
+      isAdmin() && h("span", { class: "group-tools" },
         h("button", { title: "Editar grupo", "aria-label": "Editar grupo " + g.name, onclick: (e) => { e.stopPropagation(); groupModal(g); } }, "✎"),
         h("button", { title: "Excluir grupo", "aria-label": "Excluir grupo " + g.name, onclick: (e) => { e.stopPropagation(); deleteGroup(g); } }, "✕")))),
-    item("none", "Sem grupo", state.machines.filter((m) => m.group_id == null)),
+    isAdmin() && item("none", "Sem grupo", state.machines.filter((m) => m.group_id == null)),
   );
 
   const list = visibleMachines();
@@ -247,11 +254,12 @@ function machinesView() {
     h("div", { class: "main-head" },
       h("h2", null, title),
       h("span", { class: "spacer" }),
-      h("button", { class: "btn primary", onclick: () => machineModal() }, "+ Adicionar máquina"),
+      isAdmin() && h("button", { class: "btn primary", onclick: () => machineModal() }, "+ Adicionar máquina"),
     ),
     list.length === 0
       ? h("div", { class: "empty" }, state.machines.length === 0
-          ? "Nenhuma máquina ainda. Clique em “Adicionar máquina” para gerar o comando de instalação."
+          ? (isAdmin() ? "Nenhuma máquina ainda. Clique em “Adicionar máquina” para gerar o comando de instalação."
+            : "Nenhuma máquina liberada para o seu usuário. Peça a um administrador para incluir você em um grupo.")
           : "Nenhuma máquina neste grupo.")
       : machinesTable(list),
   );
@@ -314,10 +322,10 @@ function machinesTable(list) {
     h("td", { class: "muted" }, m.online ? "online" : timeAgo(m.last_seen)),
     h("td", null, h("div", { class: "actions" },
       h("button", { class: "btn small primary", disabled: !m.online, title: m.online ? "" : "Máquina offline", onclick: () => openTerminal(m) }, "Terminal"),
-      h("button", { class: "btn small", onclick: () => machineModal(m) }, "Editar"),
-      state.downloads && m.os === "linux" && h("button", { class: "btn small" + (isOutdated(m) ? " primary" : ""), title: "Comando para atualizar o agent desta máquina, sem trocar a credencial", onclick: () => updateModal(m) }, "Atualizar agent"),
-      h("button", { class: "btn small", title: "Gera uma nova credencial e desconecta o agent atual", onclick: () => rotate(m) }, "Nova credencial"),
-      h("button", { class: "btn small danger", onclick: () => removeMachine(m) }, "Excluir"),
+      isAdmin() && h("button", { class: "btn small", onclick: () => machineModal(m) }, "Editar"),
+      isAdmin() && state.downloads && m.os === "linux" && h("button", { class: "btn small" + (isOutdated(m) ? " primary" : ""), title: "Comando para atualizar o agent desta máquina, sem trocar a credencial", onclick: () => updateModal(m) }, "Atualizar agent"),
+      isAdmin() && h("button", { class: "btn small", title: "Gera uma nova credencial e desconecta o agent atual", onclick: () => rotate(m) }, "Nova credencial"),
+      isAdmin() && h("button", { class: "btn small danger", onclick: () => removeMachine(m) }, "Excluir"),
     )),
   ));
   return h("table", null,
@@ -628,7 +636,9 @@ function createPane(machine, label, hooks) {
   const title = h("strong", null, label);
   const el = h("section", { class: "term-pane" },
     h("div", { class: "pane-bar" },
-      title, status, h("span", { class: "spacer" }), reconnect,
+      title, status,
+      state.recording && h("span", { class: "rec", title: "Esta sessão está sendo gravada (só a saída do terminal) e pode ser revista por administradores" }, "● gravando"),
+      h("span", { class: "spacer" }), reconnect,
       h("button", { class: "btn small", title: "Grava o que o terminal envia e recebe, para investigar problemas de exibição", onclick: () => traceModal() }, "Diagnóstico"),
       h("button", { class: "btn small", title: "Fechar este terminal", onclick: () => hooks.onClose() }, "✕")),
     h("div", { class: "term-host" }, host));
@@ -907,20 +917,344 @@ function createWorkspace(popup) {
   return ws_;
 }
 
+// --- users ---
+const ROLE_LABEL = { admin: "Administrador", operator: "Operador" };
+
+function usersView() {
+  const body = h("tbody");
+  const load = () => api("GET", "/api/users").then((users) => {
+    body.replaceChildren(...users.map((u) => h("tr", null,
+      h("td", null, h("strong", null, u.username), u.must_change_password && h("span", { class: "tag warn" }, "senha temporária")),
+      h("td", null, h("span", { class: "tag" }, ROLE_LABEL[u.role] || u.role)),
+      h("td", { class: "muted" }, u.role === "admin" ? "todas as máquinas"
+        : u.group_ids.length ? u.group_ids.map(groupName).filter(Boolean).join(", ") : "nenhum grupo (não vê máquinas)"),
+      h("td", null, h("div", { class: "actions" },
+        h("button", { class: "btn small", onclick: () => userModal(u, load) }, "Editar"),
+        h("button", { class: "btn small", title: "Gera uma senha temporária e encerra as sessões deste usuário", onclick: () => resetUser(u) }, "Nova senha"),
+        u.username !== state.user && h("button", { class: "btn small danger", onclick: () => deleteUser(u, load) }, "Excluir"),
+      )))));
+  }).catch(fail);
+  refresh().then(load).catch(fail); // group names come from state.groups
+  const main = h("main", { class: "main", style: "grid-column: 1 / -1" },
+    h("div", { class: "main-head" }, h("h2", null, "Usuários"), h("span", { class: "spacer" }),
+      h("button", { class: "btn primary", onclick: () => userModal(null, load) }, "+ Novo usuário")),
+    h("p", { class: "muted" }, "Administradores veem e gerenciam tudo. Operadores só abrem terminal nas máquinas dos grupos liberados para eles."),
+    h("table", null,
+      h("thead", null, h("tr", null, ["Usuário", "Papel", "Acesso", ""].map((x) => h("th", null, x)))),
+      body));
+  return h("div", { class: "content" }, main);
+}
+
+function userModal(user, reload) {
+  const name = h("input", { id: "u-name", value: user ? user.username : "", required: !user, disabled: !!user, maxlength: "64", autocomplete: "off" });
+  const role = h("select", { id: "u-role" },
+    h("option", { value: "operator", selected: !user || user.role === "operator" }, "Operador (só os grupos marcados)"),
+    h("option", { value: "admin", selected: !!user && user.role === "admin" }, "Administrador (acesso total)"));
+  const checks = state.groups.map((g) => ({ g, box: h("input", { type: "checkbox", id: "u-g-" + g.id, checked: !!user && user.group_ids.includes(g.id) }) }));
+  const groupsBox = h("div", { class: "checks" },
+    checks.length ? checks.map(({ g, box }) => h("label", { class: "check", for: "u-g-" + g.id }, box, g.name))
+      : h("span", { class: "muted" }, "Crie um grupo antes para liberar máquinas a um operador."));
+  const sync = () => { groupsBox.hidden = role.value !== "operator"; groupsLabel.hidden = groupsBox.hidden; };
+  const groupsLabel = h("label", null, "Grupos liberados");
+  role.addEventListener("change", sync);
+  const error = h("p", { class: "error", role: "alert" });
+  const close = modal(h("form", { onsubmit: async (e) => {
+    e.preventDefault();
+    const group_ids = checks.filter((c) => c.box.checked).map((c) => c.g.id);
+    try {
+      if (user) {
+        await api("PUT", `/api/users/${user.id}`, { role: role.value, group_ids });
+        close(); reload(); toast("Usuário atualizado", "ok");
+      } else {
+        const created = await api("POST", "/api/users", { username: name.value, role: role.value, group_ids });
+        close(); reload();
+        temporaryPasswordModal(created.user.username, created.temporary_password);
+      }
+    } catch (err) { error.textContent = err.message; }
+  } },
+    h("h2", null, user ? `Editar ${user.username}` : "Novo usuário"),
+    !user && h("p", { class: "muted" }, "Geramos uma senha temporária, mostrada uma única vez. No primeiro login a pessoa precisa trocá-la."),
+    h("label", { for: "u-name" }, "Usuário"), name,
+    h("label", { for: "u-role" }, "Papel"), role,
+    groupsLabel, groupsBox,
+    error,
+    h("div", { class: "modal-actions" },
+      h("button", { class: "btn", type: "button", onclick: () => close() }, "Cancelar"),
+      h("button", { class: "btn primary", type: "submit" }, user ? "Salvar" : "Criar usuário")),
+  ));
+  sync();
+}
+
+function temporaryPasswordModal(username, password) {
+  const pre = h("pre", { class: "cmd", tabindex: "0" }, password);
+  const copyBtn = h("button", { class: "btn small" }, "Copiar");
+  copyBtn.addEventListener("click", () => copy(password, copyBtn));
+  const close = modal(
+    h("h2", null, `Senha temporária de “${username}”`),
+    h("div", { class: "warn" }, "Esta senha é exibida só desta vez. Entregue-a à pessoa por um canal seguro; ela será obrigada a trocá-la no primeiro login."),
+    pre,
+    h("div", { class: "row" }, copyBtn),
+    h("div", { class: "modal-actions" }, h("button", { class: "btn primary", onclick: () => close() }, "Concluir")),
+  );
+}
+
+async function resetUser(u) {
+  if (!confirm(`Gerar nova senha temporária para “${u.username}”? As sessões abertas dele serão encerradas.`)) return;
+  try {
+    const out = await api("POST", `/api/users/${u.id}/reset`);
+    temporaryPasswordModal(u.username, out.temporary_password);
+  } catch (e) { fail(e); }
+}
+
+async function deleteUser(u, reload) {
+  if (!confirm(`Excluir o usuário “${u.username}”?`)) return;
+  try { await api("DELETE", `/api/users/${u.id}`); reload(); toast("Usuário excluído", "ok"); }
+  catch (e) { fail(e); }
+}
+
 // --- audit ---
 function auditView() {
+  const body = h("div");
+  const tab = (id, label) => h("button", { type: "button", role: "tab", class: state.auditTab === id ? "active" : "",
+    onclick: () => { state.auditTab = id; render(); } }, label);
+  const showRecordings = state.recording && state.auditTab === "recordings";
+  body.append(showRecordings ? recordingsPanel() : eventsPanel());
+  return h("div", { class: "content" }, h("main", { class: "main", style: "grid-column: 1 / -1" },
+    h("div", { class: "main-head" }, h("h2", null, "Auditoria"),
+      state.recording && h("div", { class: "tabs", role: "tablist", style: "margin:0" }, tab("events", "Eventos"), tab("recordings", "Sessões gravadas"))),
+    body));
+}
+
+function eventsPanel() {
   const body = h("tbody");
-  const main = h("main", { class: "main", style: "grid-column: 1 / -1" },
-    h("div", { class: "main-head" }, h("h2", null, "Auditoria"), h("span", { class: "muted" }, "últimos 200 eventos")),
-    h("table", { class: "audit" },
-      h("thead", null, h("tr", null, ["Quando", "Quem", "Ação", "Alvo", "Detalhe"].map((t) => h("th", null, t)))),
-      body));
   api("GET", "/api/audit?limit=200").then((entries) => {
     body.replaceChildren(...entries.map((e) => h("tr", null,
       h("td", { class: "mono" }, new Date(e.at).toLocaleString()), h("td", null, e.actor),
       h("td", null, h("span", { class: "tag" }, e.action)), h("td", { class: "mono" }, e.target), h("td", { class: "muted" }, e.detail))));
   }).catch(fail);
-  return h("div", { class: "content" }, main);
+  return h("div", null, h("p", { class: "muted" }, "últimos 200 eventos"),
+    h("table", { class: "audit" },
+      h("thead", null, h("tr", null, ["Quando", "Quem", "Ação", "Alvo", "Detalhe"].map((x) => h("th", null, x)))),
+      body));
+}
+
+// --- recorded sessions ---
+function formatDuration(seconds) {
+  const s = Math.max(0, Math.round(seconds));
+  const m = Math.floor(s / 60), sec = String(s % 60).padStart(2, "0");
+  return s >= 3600 ? `${Math.floor(m / 60)}:${String(m % 60).padStart(2, "0")}:${sec}` : `${m}:${sec}`;
+}
+function formatSize(bytes) {
+  if (bytes < 1024) return `${bytes} B`;
+  if (bytes < 1048576) return `${(bytes / 1024).toFixed(1)} KB`;
+  return `${(bytes / 1048576).toFixed(1)} MB`;
+}
+
+function recordingsPanel() {
+  const body = h("tbody");
+  const load = () => api("GET", "/api/recordings?limit=200").then((list) => {
+    if (!list.length) {
+      body.replaceChildren(h("tr", null, h("td", { colspan: "6", class: "muted" }, "Nenhuma sessão gravada ainda. Cada terminal aberto no painel passa a ser gravado.")));
+      return;
+    }
+    body.replaceChildren(...list.map((r) => h("tr", null,
+      h("td", { class: "mono" }, new Date(r.started_at).toLocaleString()),
+      h("td", null, r.username),
+      h("td", null, r.machine_name),
+      h("td", null, r.duration_seconds == null ? h("span", { class: "tag" }, "gravando") : formatDuration(r.duration_seconds),
+        r.truncated && h("span", { class: "tag warn", title: "A gravação passou do limite de tamanho e foi cortada" }, "cortada")),
+      h("td", { class: "muted" }, formatSize(r.bytes)),
+      h("td", null, h("div", { class: "actions" },
+        h("button", { class: "btn small primary", onclick: () => playRecording(r) }, "Assistir"),
+        h("a", { class: "btn small", href: `/api/recordings/${r.id}/cast`, download: `${r.machine_name}-${r.id.slice(0, 8)}.cast`, title: "Baixa no formato asciicast (asciinema)" }, "Baixar"),
+        h("button", { class: "btn small danger", onclick: () => deleteRecording(r, load) }, "Excluir"))))));
+  }).catch(fail);
+  load();
+  return h("div", null,
+    h("p", { class: "muted" }, "Só a saída do terminal é gravada, nunca o que a pessoa digita (senhas digitadas sem eco não aparecem). Quem assiste ou apaga fica registrado em Eventos."),
+    h("table", { class: "audit" },
+      h("thead", null, h("tr", null, ["Início", "Quem", "Máquina", "Duração", "Tamanho", ""].map((x) => h("th", null, x)))),
+      body));
+}
+
+async function deleteRecording(r, reload) {
+  if (!confirm(`Apagar a gravação de ${r.username} em ${r.machine_name}? Não dá para desfazer.`)) return;
+  try { await api("DELETE", `/api/recordings/${r.id}`); reload(); toast("Gravação apagada", "ok"); }
+  catch (e) { fail(e); }
+}
+
+// playRecording replays an asciicast in a read-only xterm.js. Pauses longer
+// than IDLE_LIMIT seconds are shortened so long idle stretches do not stall the replay.
+const IDLE_LIMIT = 2;
+async function playRecording(rec) {
+  let text;
+  try {
+    const resp = await fetch(`/api/recordings/${rec.id}/cast`, { credentials: "same-origin" });
+    if (!resp.ok) throw new Error(((await resp.json().catch(() => null)) || {}).error || resp.statusText);
+    text = await resp.text();
+  } catch (e) { fail(e); return; }
+  const lines = text.split("\n").filter(Boolean);
+  let header;
+  try { header = JSON.parse(lines[0]); } catch (_) { toast("Arquivo de gravação inválido.", "err"); return; }
+  const events = [];
+  let previous = 0, clock = 0;
+  for (const line of lines.slice(1)) {
+    try {
+      const [t, kind, data] = JSON.parse(line);
+      if (kind !== "o" && kind !== "r") continue;
+      clock += Math.min(Math.max(t - previous, 0), IDLE_LIMIT);
+      previous = t;
+      events.push({ at: clock, kind, data });
+    } catch (_) { /* skip a damaged line */ }
+  }
+  const total = events.length ? events[events.length - 1].at : 0;
+
+  const host = h("div", { class: "term" });
+  const playBtn = h("button", { class: "btn small primary", style: "min-width:84px", title: "Pausar / continuar (espaço)" }, "Pausar");
+  const ctl = (label, title, fn) => h("button", { class: "btn small", title, "aria-label": /[A-Za-zÀ-ú]{3,}/.test(label) ? false : title, onclick: (e) => { fn(); if (e.detail > 0) e.currentTarget.blur(); } }, label); // mouse clicks give the focus back so Space keeps toggling playback; icon-only buttons need an accessible name
+  const slider = h("input", { type: "range", min: "0", max: String(Math.round(total * 1000)), value: "0", class: "player-slider", "aria-label": "Posição" });
+  const label = h("span", { class: "mono muted" }, `0:00 / ${formatDuration(total)}`);
+  const speed = h("select", { class: "pick", "aria-label": "Velocidade" },
+    ...[0.5, 1, 2, 4, 8].map((v) => h("option", { value: String(v), selected: v === 1 }, v + "x")));
+  const overlay = h("div", { class: "player-overlay" },
+    h("div", { class: "term-bar" },
+      h("span", { class: "brand" }, "Gravação"),
+      h("span", { class: "muted" }, `${rec.username} em ${rec.machine_name}, ${new Date(rec.started_at).toLocaleString()}`),
+      h("span", { class: "spacer" }),
+      h("button", { class: "btn small", onclick: () => end() }, "Fechar")),
+    h("div", { class: "player-host" }, host),
+    h("div", { class: "player-controls" },
+      ctl("⏹", "Parar e voltar ao início (Home)", () => { pause(); seek(0); playBtn.textContent = "Reproduzir"; }),
+      ctl("⏪ 10s", "Voltar 10 segundos (Shift+←)", () => jump(-10)),
+      ctl("◀", "Evento anterior: volta um passo da gravação, tecla por tecla (,)", () => step(-1)),
+      playBtn,
+      ctl("▶", "Próximo evento: avança um passo da gravação, tecla por tecla (.)", () => step(1)),
+      ctl("10s ⏩", "Avançar 10 segundos (Shift+→)", () => jump(10)),
+      slider, label, speed,
+      ctl("Copiar seleção", "Copia o texto selecionado (ou a tela atual, se nada estiver selecionado). Ctrl+C também copia a seleção", () => copyScreen()),
+      ctl("Copiar tudo", "Copia toda a saída da sessão como texto", () => copyAll())));
+  document.body.append(overlay);
+
+  await loadTerminalFonts();
+  const term = new Terminal({
+    cols: header.width || 80, rows: header.height || 24, disableStdin: true, cursorBlink: false, scrollback: 5000,
+    fontFamily: termFontFamily(), fontSize: termFontSize(),
+    theme: { background: "#1a1c2c", foreground: "#f4f4f4", cursor: "#ffcd75" },
+  });
+  term.open(host);
+  term.attachCustomKeyEventHandler(terminalKeyHandler(term)); // Ctrl+C copies the selection
+
+  let pos = 0, now = 0, timer = null, playing = false;
+  const apply = (ev) => {
+    if (ev.kind === "o") { term.write(ev.data); return; }
+    const [c, r] = String(ev.data).split("x").map(Number);
+    if (c > 0 && r > 0) term.resize(c, r);
+  };
+  const show = () => {
+    slider.value = String(Math.round(now * 1000));
+    label.textContent = `${formatDuration(now)} / ${formatDuration(total)}`;
+  };
+  function stopTimer() { clearTimeout(timer); timer = null; }
+  function tick() {
+    stopTimer();
+    if (!playing) return;
+    if (pos >= events.length) { playing = false; playBtn.textContent = "Reiniciar"; return; }
+    const wait = Math.max(0, (events[pos].at - now) / Number(speed.value) * 1000);
+    timer = setTimeout(() => {
+      now = events[pos].at;
+      // events within one frame go out together
+      while (pos < events.length && events[pos].at - now < 0.016) apply(events[pos++]);
+      show();
+      tick();
+    }, wait);
+  }
+  function play() { playing = true; playBtn.textContent = "Pausar"; if (pos >= events.length) seek(0); tick(); }
+  function pause() { playing = false; stopTimer(); playBtn.textContent = "Continuar"; }
+  // seek rebuilds the screen up to the given effective time.
+  function seek(seconds) {
+    stopTimer();
+    term.reset();
+    term.resize(header.width || 80, header.height || 24);
+    let out = "", i = 0;
+    for (; i < events.length && events[i].at <= seconds; i++) {
+      if (events[i].kind === "o") out += events[i].data;
+      else { if (out) { term.write(out); out = ""; } apply(events[i]); }
+    }
+    if (out) term.write(out);
+    pos = i;
+    now = seconds;
+    show();
+    if (playing) tick();
+  }
+  // jump moves by seconds of (shortened) replay time; step moves to the previous/next event.
+  function jump(delta) { seek(Math.min(total, Math.max(0, now + delta))); }
+  function step(direction) {
+    if (playing) pause();
+    if (direction > 0) {
+      if (pos < events.length) seek(events[pos].at);
+      return;
+    }
+    const current = pos > 0 ? events[pos - 1].at : 0;
+    let i = pos - 1;
+    while (i >= 0 && events[i].at >= current) i--;
+    seek(i >= 0 ? events[i].at : 0);
+  }
+  // screenText reads a terminal buffer as plain text, joining wrapped lines.
+  const bufferText = (t, last) => {
+    const b = t.buffer.active;
+    const out = [];
+    for (let y = 0; y < Math.min(b.length, last); y++) {
+      const line = b.getLine(y);
+      if (!line) continue;
+      const text = line.translateToString(true);
+      if (line.isWrapped && out.length) out[out.length - 1] += text; else out.push(text);
+    }
+    while (out.length && !out[out.length - 1].trim()) out.pop();
+    return out.join("\n");
+  };
+  async function copyScreen() {
+    const text = term.hasSelection() ? term.getSelection() : bufferText(term, Infinity);
+    const ok = text && await writeClipboard(text);
+    toast(ok ? (term.hasSelection() ? "Seleção copiada" : "Tela copiada") : "Não consegui copiar; selecione o texto e use Ctrl+C.", ok ? "ok" : "err");
+  }
+  // copyAll replays the whole session into a throwaway terminal and reads its buffer.
+  async function copyAll() {
+    const scratch = new Terminal({ cols: header.width || 80, rows: header.height || 24, scrollback: 100000, allowProposedApi: true });
+    const write = (data) => new Promise((resolve) => scratch.write(data, resolve));
+    let out = "";
+    for (const ev of events) {
+      if (ev.kind === "o") out += ev.data;
+      else { if (out) { await write(out); out = ""; } const [c, r] = String(ev.data).split("x").map(Number); if (c > 0 && r > 0) scratch.resize(c, r); }
+    }
+    if (out) await write(out);
+    const text = bufferText(scratch, Infinity);
+    scratch.dispose();
+    const ok = text && await writeClipboard(text);
+    toast(ok ? "Saída completa copiada" : "Não consegui copiar.", ok ? "ok" : "err");
+  }
+  playBtn.addEventListener("click", (e) => { if (playing) pause(); else play(); if (e.detail > 0) playBtn.blur(); });
+  slider.addEventListener("input", () => seek(Number(slider.value) / 1000));
+  speed.addEventListener("change", () => { if (playing) tick(); });
+  const onKey = (e) => {
+    if (document.querySelector(".overlay")) return;
+    if (e.key === "Escape") { end(); return; }
+    const t = e.target.tagName;
+    if (t === "INPUT" || t === "SELECT" || t === "TEXTAREA") return; // slider and speed keep their own keys
+    if (e.key === " " && t !== "BUTTON") { e.preventDefault(); playBtn.click(); }
+    else if (e.key === "ArrowLeft") { e.preventDefault(); jump(e.shiftKey ? -10 : -5); }
+    else if (e.key === "ArrowRight") { e.preventDefault(); jump(e.shiftKey ? 10 : 5); }
+    else if (e.key === ",") step(-1);
+    else if (e.key === ".") step(1);
+    else if (e.key === "Home") { e.preventDefault(); pause(); seek(0); playBtn.textContent = "Reproduzir"; }
+  };
+  document.addEventListener("keydown", onKey);
+  function end() {
+    stopTimer();
+    document.removeEventListener("keydown", onKey);
+    term.dispose();
+    overlay.remove();
+  }
+  play();
 }
 
 // ---------- boot ----------
@@ -928,9 +1262,11 @@ function auditView() {
   try {
     const me = await api("GET", "/api/me");
     state.user = me.username;
+    state.role = me.role || "admin";
     state.mustChange = !!me.must_change_password;
     state.serverVersion = me.server_version || "";
     state.downloads = !!me.agent_downloads;
+    state.recording = !!me.recording;
     if (!state.mustChange) { await refresh(); startPolling(); }
   } catch (_) { state.user = null; }
   render();

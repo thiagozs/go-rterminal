@@ -253,3 +253,65 @@ func TestOpenMigratesOlderDatabase(t *testing.T) {
 	}
 	s2.Close()
 }
+
+// A database from before roles existed must keep working, with its accounts
+// promoted to administrators (they had full access).
+func TestMigrationGivesExistingAccountsTheAdminRole(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "old.db")
+	old, err := sql.Open("sqlite", "file:"+path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := old.Exec(`CREATE TABLE admins (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, username TEXT NOT NULL UNIQUE,
+		password_hash TEXT NOT NULL, created_at INTEGER NOT NULL, must_change_password INTEGER NOT NULL DEFAULT 0);
+		INSERT INTO admins(username, password_hash, created_at) VALUES('legacy', 'x', 1)`); err != nil {
+		t.Fatal(err)
+	}
+	old.Close()
+
+	s, err := Open(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	users, err := s.ListUsers()
+	if err != nil || len(users) != 1 || users[0].Role != RoleAdmin {
+		t.Fatalf("users = %+v, %v", users, err)
+	}
+}
+
+func TestOperatorAccessFollowsGroups(t *testing.T) {
+	s := newTestStore(t)
+	g, _ := s.CreateGroup("homelab", "")
+	other, _ := s.CreateGroup("cliente", "")
+	inside, _, _ := s.CreateMachine("pi", &g.ID)
+	outside, _, _ := s.CreateMachine("vps", &other.ID)
+	loose, _, _ := s.CreateMachine("solta", nil)
+	op, err := s.CreateUser("ana", "password-1", RoleOperator, []int64{g.ID}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admin, _ := s.CreateAdmin("root", "password-1", false)
+
+	for _, c := range []struct {
+		who  *Admin
+		m    *Machine
+		want bool
+	}{{op, inside, true}, {op, outside, false}, {op, loose, false}, {admin, outside, true}, {admin, loose, true}} {
+		got, err := s.CanAccessMachine(c.who, c.m)
+		if err != nil || got != c.want {
+			t.Errorf("%s on %s = %v, %v; want %v", c.who.Username, c.m.Name, got, err, c.want)
+		}
+	}
+	// Deleting the group removes the access (cascade), without touching the account.
+	if err := s.DeleteGroup(g.ID); err != nil {
+		t.Fatal(err)
+	}
+	if ids, _ := s.UserGroupIDs(op.ID); len(ids) != 0 {
+		t.Errorf("groups after delete = %v", ids)
+	}
+	if err := s.DeleteUser(admin.ID); !errors.Is(err, ErrLastAdmin) {
+		t.Errorf("deleting last admin = %v, want ErrLastAdmin", err)
+	}
+}

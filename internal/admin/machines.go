@@ -42,14 +42,23 @@ func (s *Server) view(m store.Machine) machineView {
 	return machineView{Machine: m, Online: s.relay.IsOnline(m.ID)}
 }
 
-func (s *Server) listMachines(w http.ResponseWriter, _ *http.Request, _ *store.Admin) {
+func (s *Server) listMachines(w http.ResponseWriter, _ *http.Request, admin *store.Admin) {
 	machines, err := s.store.ListMachines()
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	scope, err := s.groupScope(admin)
 	if err != nil {
 		s.storeError(w, err)
 		return
 	}
 	views := make([]machineView, 0, len(machines))
 	for _, m := range machines {
+		// Operators only see machines of their groups (never ungrouped ones).
+		if scope != nil && (m.GroupID == nil || !scope[*m.GroupID]) {
+			continue
+		}
 		views = append(views, s.view(m))
 	}
 	writeJSON(w, http.StatusOK, views)

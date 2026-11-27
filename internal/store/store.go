@@ -21,6 +21,8 @@ var (
 	ErrConflict           = errors.New("already exists")
 	ErrInvalid            = errors.New("invalid input")
 	ErrInvalidCredentials = errors.New("invalid credentials")
+	// ErrLastAdmin protects the panel from being left without an administrator.
+	ErrLastAdmin = errors.New("cannot remove the last administrator")
 )
 
 // BcryptCost is the bcrypt work factor for admin passwords; tests lower it.
@@ -32,7 +34,13 @@ CREATE TABLE IF NOT EXISTS admins (
 	username TEXT NOT NULL UNIQUE,
 	password_hash TEXT NOT NULL,
 	created_at INTEGER NOT NULL,
-	must_change_password INTEGER NOT NULL DEFAULT 0
+	must_change_password INTEGER NOT NULL DEFAULT 0,
+	role TEXT NOT NULL DEFAULT 'admin'
+);
+CREATE TABLE IF NOT EXISTS user_groups (
+	user_id INTEGER NOT NULL REFERENCES admins(id) ON DELETE CASCADE,
+	group_id INTEGER NOT NULL REFERENCES groups(id) ON DELETE CASCADE,
+	PRIMARY KEY (user_id, group_id)
 );
 CREATE TABLE IF NOT EXISTS web_sessions (
 	token_hash TEXT PRIMARY KEY,
@@ -57,6 +65,17 @@ CREATE TABLE IF NOT EXISTS machines (
 	arch TEXT NOT NULL DEFAULT '',
 	version TEXT NOT NULL DEFAULT ''
 );
+CREATE TABLE IF NOT EXISTS recordings (
+	id TEXT PRIMARY KEY,
+	machine_id TEXT NOT NULL,
+	machine_name TEXT NOT NULL,
+	username TEXT NOT NULL,
+	started_at INTEGER NOT NULL,
+	ended_at INTEGER,
+	bytes INTEGER NOT NULL DEFAULT 0,
+	truncated INTEGER NOT NULL DEFAULT 0
+);
+CREATE INDEX IF NOT EXISTS recordings_started ON recordings(started_at);
 CREATE TABLE IF NOT EXISTS audit_log (
 	id INTEGER PRIMARY KEY AUTOINCREMENT,
 	at INTEGER NOT NULL,
@@ -92,7 +111,11 @@ func Open(path string) (*Store, error) {
 
 // migrate upgrades databases created by earlier versions.
 func migrate(db *sql.DB) error {
-	return addColumnIfMissing(db, "admins", "must_change_password", "INTEGER NOT NULL DEFAULT 0")
+	if err := addColumnIfMissing(db, "admins", "must_change_password", "INTEGER NOT NULL DEFAULT 0"); err != nil {
+		return err
+	}
+	// Accounts created before roles existed are administrators.
+	return addColumnIfMissing(db, "admins", "role", "TEXT NOT NULL DEFAULT 'admin'")
 }
 
 func addColumnIfMissing(db *sql.DB, table, column, definition string) error {
@@ -171,4 +194,9 @@ func Slug(name string) string {
 		slug = strings.Trim(slug[:32], "-")
 	}
 	return slug
+}
+
+func isForeignKey(err error) bool {
+	var sqlErr *sqlite.Error
+	return errors.As(err, &sqlErr) && sqlErr.Code() == sqlite3.SQLITE_CONSTRAINT_FOREIGNKEY
 }

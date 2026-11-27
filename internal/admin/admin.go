@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/gorilla/websocket"
+	"github.com/thiagozs/go-rterminal/internal/recording"
 	"github.com/thiagozs/go-rterminal/internal/relay"
 	"github.com/thiagozs/go-rterminal/internal/store"
 )
@@ -42,7 +43,7 @@ const (
 type Relay interface {
 	IsOnline(id string) bool
 	Disconnect(id, reason string)
-	OpenTerminal(machineID string, conn *websocket.Conn) (string, error)
+	OpenTerminal(machineID string, conn *websocket.Conn, tap relay.Tap) (string, error)
 }
 
 type Config struct {
@@ -60,7 +61,10 @@ type Config struct {
 	AgentsDir string
 	// Version identifies this build; agents reporting a different one are
 	// flagged as outdated in the UI.
-	Version    string
+	Version string
+	// Recordings, when set, records every web terminal session for replay in
+	// the audit area. Nil disables recording.
+	Recordings *recording.Manager
 	SessionTTL time.Duration
 	Logger     *log.Logger
 }
@@ -72,6 +76,7 @@ type Server struct {
 	trusted    []*net.IPNet
 	agentsDir  string
 	version    string
+	recordings *recording.Manager
 	sessionTTL time.Duration
 	logger     *log.Logger
 	limiter    *loginLimiter // per client IP (login) and per admin (password change)
@@ -95,6 +100,7 @@ func New(config Config) *Server {
 		trusted:    config.TrustedProxies,
 		agentsDir:  config.AgentsDir,
 		version:    config.Version,
+		recordings: config.Recordings,
 		sessionTTL: ttl,
 		logger:     logger,
 		limiter:    newLoginLimiter(5, 5*time.Minute),
@@ -113,17 +119,27 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/password", s.authedAny(s.changePassword))
 
 	mux.HandleFunc("GET /api/groups", s.authed(s.listGroups))
-	mux.HandleFunc("POST /api/groups", s.authed(s.createGroup))
-	mux.HandleFunc("PUT /api/groups/{id}", s.authed(s.updateGroup))
-	mux.HandleFunc("DELETE /api/groups/{id}", s.authed(s.deleteGroup))
+	mux.HandleFunc("POST /api/groups", s.adminOnly(s.createGroup))
+	mux.HandleFunc("PUT /api/groups/{id}", s.adminOnly(s.updateGroup))
+	mux.HandleFunc("DELETE /api/groups/{id}", s.adminOnly(s.deleteGroup))
 
 	mux.HandleFunc("GET /api/machines", s.authed(s.listMachines))
-	mux.HandleFunc("POST /api/machines", s.authed(s.createMachine))
-	mux.HandleFunc("PUT /api/machines/{id}", s.authed(s.updateMachine))
-	mux.HandleFunc("DELETE /api/machines/{id}", s.authed(s.deleteMachine))
-	mux.HandleFunc("POST /api/machines/{id}/rotate", s.authed(s.rotateMachine))
+	mux.HandleFunc("POST /api/machines", s.adminOnly(s.createMachine))
+	mux.HandleFunc("PUT /api/machines/{id}", s.adminOnly(s.updateMachine))
+	mux.HandleFunc("DELETE /api/machines/{id}", s.adminOnly(s.deleteMachine))
+	mux.HandleFunc("POST /api/machines/{id}/rotate", s.adminOnly(s.rotateMachine))
 
-	mux.HandleFunc("GET /api/audit", s.authed(s.listAudit))
+	mux.HandleFunc("GET /api/users", s.adminOnly(s.listUsers))
+	mux.HandleFunc("POST /api/users", s.adminOnly(s.createUser))
+	mux.HandleFunc("PUT /api/users/{id}", s.adminOnly(s.updateUser))
+	mux.HandleFunc("DELETE /api/users/{id}", s.adminOnly(s.deleteUser))
+	mux.HandleFunc("POST /api/users/{id}/reset", s.adminOnly(s.resetUser))
+
+	mux.HandleFunc("GET /api/recordings", s.adminOnly(s.listRecordings))
+	mux.HandleFunc("GET /api/recordings/{id}/cast", s.adminOnly(s.recordingCast))
+	mux.HandleFunc("DELETE /api/recordings/{id}", s.adminOnly(s.deleteRecording))
+
+	mux.HandleFunc("GET /api/audit", s.adminOnly(s.listAudit))
 	mux.HandleFunc("GET /ws/terminal", s.terminal)
 	mux.HandleFunc("GET /download/agent/{target}", s.downloadAgent)
 
@@ -195,6 +211,34 @@ func (s *Server) authedWith(next authedHandler, allowPending bool) http.HandlerF
 	}
 }
 
+// adminOnly additionally requires the administrator role; operators get 403.
+func (s *Server) adminOnly(next authedHandler) http.HandlerFunc {
+	return s.authed(func(w http.ResponseWriter, r *http.Request, admin *store.Admin) {
+		if !admin.IsAdmin() {
+			writeError(w, http.StatusForbidden, "administrator required")
+			return
+		}
+		next(w, r, admin)
+	})
+}
+
+// groupScope returns the groups an account may see; nil means all of them
+// (administrators).
+func (s *Server) groupScope(admin *store.Admin) (map[int64]bool, error) {
+	if admin.IsAdmin() {
+		return nil, nil
+	}
+	ids, err := s.store.UserGroupIDs(admin.ID)
+	if err != nil {
+		return nil, err
+	}
+	set := make(map[int64]bool, len(ids))
+	for _, id := range ids {
+		set[id] = true
+	}
+	return set, nil
+}
+
 func checkCSRF(r *http.Request) bool {
 	switch r.Method {
 	case http.MethodGet, http.MethodHead, http.MethodOptions:
@@ -240,6 +284,8 @@ func (s *Server) storeError(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusConflict, "already exists")
 	case errors.Is(err, store.ErrInvalid):
 		writeError(w, http.StatusBadRequest, "invalid input")
+	case errors.Is(err, store.ErrLastAdmin):
+		writeError(w, http.StatusConflict, err.Error())
 	default:
 		s.logger.Printf("[admin] erro interno: %v", err)
 		writeError(w, http.StatusInternalServerError, "internal error")
@@ -377,9 +423,11 @@ func (s *Server) logout(w http.ResponseWriter, r *http.Request, admin *store.Adm
 func (s *Server) sessionView(admin *store.Admin) map[string]any {
 	return map[string]any{
 		"username":             admin.Username,
+		"role":                 admin.Role,
 		"must_change_password": admin.MustChangePassword,
 		"server_version":       s.version,
 		"agent_downloads":      len(s.agentTargets()) > 0,
+		"recording":            s.recordings != nil,
 	}
 }
 
@@ -439,11 +487,25 @@ type groupInput struct {
 	Description string `json:"description"`
 }
 
-func (s *Server) listGroups(w http.ResponseWriter, _ *http.Request, _ *store.Admin) {
+func (s *Server) listGroups(w http.ResponseWriter, _ *http.Request, admin *store.Admin) {
 	groups, err := s.store.ListGroups()
 	if err != nil {
 		s.storeError(w, err)
 		return
+	}
+	scope, err := s.groupScope(admin)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	if scope != nil {
+		visible := groups[:0]
+		for _, g := range groups {
+			if scope[g.ID] {
+				visible = append(visible, g)
+			}
+		}
+		groups = visible
 	}
 	writeJSON(w, http.StatusOK, groups)
 }
@@ -533,6 +595,17 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
 		s.storeError(w, err)
 		return
 	}
+	allowed, err := s.store.CanAccessMachine(admin, machine)
+	if err != nil {
+		s.storeError(w, err)
+		return
+	}
+	if !allowed {
+		// Same answer as an unknown machine, so ids cannot be probed.
+		s.audit(admin.Username, "terminal_denied", machine.ID, "outside the account's groups")
+		writeError(w, http.StatusNotFound, "not found")
+		return
+	}
 	if !s.relay.IsOnline(machine.ID) {
 		writeError(w, http.StatusConflict, "machine offline")
 		return
@@ -541,7 +614,16 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
 	if err != nil {
 		return // Upgrade already replied (e.g. origin rejected).
 	}
-	sessionID, err := s.relay.OpenTerminal(machine.ID, conn)
+	// The recorder creates its file at the first event, so a session that
+	// never starts leaves nothing behind.
+	var tap relay.Tap
+	detail := ""
+	if s.recordings != nil {
+		rec := s.recordings.Start(recording.Meta{MachineID: machine.ID, MachineName: machine.Name, Username: admin.Username})
+		tap = rec
+		detail = " recording " + rec.ID()
+	}
+	sessionID, err := s.relay.OpenTerminal(machine.ID, conn, tap)
 	if err != nil {
 		reason := "could not start session"
 		if errors.Is(err, relay.ErrAgentOffline) {
@@ -552,5 +634,5 @@ func (s *Server) terminal(w http.ResponseWriter, r *http.Request) {
 		_ = conn.Close()
 		return
 	}
-	s.audit(admin.Username, "terminal_open", machine.ID, "session "+sessionID)
+	s.audit(admin.Username, "terminal_open", machine.ID, "session "+sessionID+detail)
 }

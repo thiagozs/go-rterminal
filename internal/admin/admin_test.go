@@ -41,6 +41,16 @@ type env struct {
 
 func newEnv(t *testing.T, tweaks ...func(*Config)) *env {
 	t.Helper()
+	return newEnvWithStore(t, func(c *Config, _ *store.Store) {
+		for _, tweak := range tweaks {
+			tweak(c)
+		}
+	})
+}
+
+// newEnvWithStore is newEnv for tweaks that need the store (e.g. recordings).
+func newEnvWithStore(t *testing.T, tweak func(*Config, *store.Store)) *env {
+	t.Helper()
 	st, err := store.Open(filepath.Join(t.TempDir(), "t.db"))
 	if err != nil {
 		t.Fatal(err)
@@ -62,9 +72,7 @@ func newEnv(t *testing.T, tweaks ...func(*Config)) *env {
 		Logger:         quiet,
 	})
 	cfg := Config{Store: st, Relay: rl, Logger: quiet}
-	for _, tweak := range tweaks {
-		tweak(&cfg)
-	}
+	tweak(&cfg, st)
 	adm := New(cfg)
 
 	mux := http.NewServeMux()

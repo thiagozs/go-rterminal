@@ -135,10 +135,39 @@ Como funciona:
 
 - **Credencial por maquina**: guardada so como hash (SHA-256). O `agent-id` vem da credencial, entao um agent nao consegue se passar por outro. **Nova credencial** invalida a antiga e derruba o agent conectado; **Excluir** tambem o desconecta.
 - **Login do administrador**: senha com bcrypt, cookie `HttpOnly` + `SameSite=Strict` (e `Secure` com HTTPS), HSTS quando o `--public-url` e https, limite de tentativas por IP e por usuario (tambem na troca de senha), e protecao CSRF (cabecalho `X-Requested-With` em toda escrita). O WebSocket do terminal recusa origens diferentes.
-- **Auditoria**: logins, falhas de login, mudancas em grupos e maquinas, rotacao de credenciais e cada terminal aberto.
+- **Auditoria**: logins, falhas de login, mudancas em grupos e maquinas, rotacao de credenciais e cada terminal aberto. Veja tambem [Gravacao e reproducao de sessoes](#gravacao-e-reproducao-de-sessoes).
 - **Clientes CLI**: com `--db`, `--auth-token` passa a ser opcional e so autentica o client de linha de comando, com acesso a qualquer maquina online. Sem ele, so o painel abre sessoes.
 
-Limites desta versao: ha um unico papel (administrador); os grupos organizam as maquinas, mas ainda nao restringem acesso. Nao ha rede entre as maquinas (IP, ping): isso e outro produto. Use HTTPS (`--tls-cert`/`--tls-key` ou um proxy como acima): sem TLS, a senha e as credenciais trafegam em texto puro, e o server avisa no log.
+Limites desta versao: so ha dois papeis (administrador e operador, veja [Usuarios e acesso por grupo](#usuarios-e-acesso-por-grupo)); o acesso e por grupo inteiro, sem permissoes por maquina. Nao ha rede entre as maquinas (IP, ping): isso e outro produto. Use HTTPS (`--tls-cert`/`--tls-key` ou um proxy como acima): sem TLS, a senha e as credenciais trafegam em texto puro, e o server avisa no log.
+
+### Usuarios e acesso por grupo
+
+A aba **Usuarios** (so para administradores) cadastra quem entra no painel. Ha dois papeis:
+
+| Papel | O que pode |
+| --- | --- |
+| **Administrador** | tudo: maquinas, grupos, usuarios, auditoria, comandos de instalacao e terminal em qualquer maquina |
+| **Operador** | **apenas abrir terminal** nas maquinas dos grupos que foram liberados para ele |
+
+- **Criar**: informe o usuario, o papel e (para operador) os grupos. O painel gera uma **senha temporaria**, mostrada uma unica vez, que a pessoa e obrigada a trocar no primeiro login. **Nova senha** gera outra e encerra as sessoes dela.
+- O operador **so enxerga** os grupos e as maquinas liberados; maquinas **sem grupo** ficam so para administradores. Ele nao ve botoes de cadastro, credencial, atualizacao de agent nem a auditoria, e a API devolve `403` para essas rotas (e o download do agent nao aceita o login dele).
+- Tentar abrir o terminal de uma maquina fora dos grupos responde como se ela nao existisse (`404`) e fica na auditoria como `terminal_denied`.
+- Mudar o papel ou os grupos vale **na proxima requisicao**. Um terminal ja aberto nao e derrubado; para cortar na hora, use **Nova senha** (encerra as sessoes do painel) ou **Excluir**. Quem ja tinha conta antes desta versao continua administrador.
+- O sistema nao deixa excluir ou rebaixar o **ultimo administrador**, e ninguem exclui a propria conta.
+- Excluir um grupo tira o acesso de quem so o tinha por ele; as contas permanecem.
+
+### Gravacao e reproducao de sessoes
+
+Cada terminal aberto no painel e **gravado** e fica em **Auditoria > Sessoes gravadas** (so para administradores). O terminal mostra o que acontece: a gravacao nao e escondida de quem usa, mas confira a politica da sua equipe antes de ativar.
+
+- **Assistir**: reproduz no navegador. Controles: **parar** (volta ao inicio), **pausar/continuar**, **voltar e avancar 10 s**, **evento anterior/proximo** (passo a passo, tecla por tecla), barra para ir a qualquer ponto, **velocidade** (0.5x a 8x) e reiniciar. Atalhos: `Espaco` pausa/continua, `←`/`→` pulam 5 s (com `Shift`, 10 s), `,`/`.` andam um evento, `Home` volta ao inicio e `Esc` fecha. Pausas longas (mais de 2 s) sao encurtadas na reproducao.
+- **Copiar**: selecione texto na tela e use `Ctrl+C` (ou **Copiar selecao**; sem selecao, copia a tela atual). **Copiar tudo** leva toda a saida da sessao, em texto puro, para a area de transferencia e voce cola onde quiser. O player e somente leitura, entao colar nele nao faz nada.
+- **Baixar**: entrega o arquivo no formato [asciicast v2](https://docs.asciinema.org/manual/asciicast/v2/), que toca no `asciinema play` e no player web do asciinema.
+- **So a saida e gravada, nunca o que a pessoa digita.** Senhas digitadas sem eco (sudo, ssh) nao aparecem; os comandos aparecem porque o shell os repete na tela. Mesmo assim, **a tela pode mostrar segredos** (um `cat .env`, por exemplo): trate as gravacoes como dados sensiveis. Elas ficam em arquivos `0600` e so administradores as acessam.
+- Quem assiste, baixa ou apaga uma gravacao fica registrado em **Eventos** (`recording_view`, `recording_delete`), e o `terminal_open` traz o id da gravacao.
+- Uma gravacao sobrevive a exclusao da maquina (guarda o nome), e as que ficaram abertas por uma queda do server sao fechadas ao iniciar.
+- **Espaco em disco**: ha o limite por sessao e a retencao (veja `--recordings-*`). As gravacoes ficam no volume `/data`, junto do banco, entao entram no seu backup.
+- Nao cobre o **client de linha de comando** (`cmd/client`): ele usa o token compartilhado, sem identidade de usuario. So o terminal do painel e gravado.
 
 ### Varios terminais: abas, divisao e popup
 
@@ -223,6 +252,10 @@ O banco em `/data` e preservado entre atualizacoes.
 - `--admin-user` usuario do primeiro administrador (padrao `admin`); a senha inicial e temporaria, gerada e logada uma vez (ou vem de `RTERMINAL_ADMIN_PASSWORD`)
 - `--agents-dir` pasta com os binarios `agent-<os>-<arch>` distribuidos em `/download/agent/` (padrao `$RTERMINAL_AGENTS_DIR`)
 - `--trusted-proxies` CIDRs dos proxies reversos cujo `X-Forwarded-For` e confiavel (ex: `172.16.0.0/12`); sem isso, atras de um proxy todos os logins pareceriam vir do IP do proxy
+- `--recordings` grava as sessoes do terminal web (padrao `true`, so com `--db`); `--recordings=false` desliga
+- `--recordings-dir` pasta das gravacoes (padrao: `recordings` ao lado do `--db`, ou seja, dentro de `/data` no Docker)
+- `--recordings-max-mb` tamanho maximo de uma gravacao (padrao `50`); ao passar, a gravacao e cortada com um aviso
+- `--recordings-retention-days` apaga gravacoes mais antigas (padrao `90`, `0` guarda para sempre)
 - `--tls-cert` caminho do certificado TLS (opcional)
 - `--tls-key` caminho da chave TLS (opcional)
 - `--session-timeout` timeout para pareamento de sessao (padrao `15s`, `0` desativa)

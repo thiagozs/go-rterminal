@@ -3,7 +3,6 @@ package store
 import (
 	"database/sql"
 	"errors"
-	"strings"
 	"time"
 
 	"golang.org/x/crypto/bcrypt"
@@ -16,7 +15,18 @@ type Admin struct {
 	// MustChangePassword is set for temporary passwords; the admin API only
 	// allows changing the password until it is cleared.
 	MustChangePassword bool `json:"must_change_password"`
+	// Role is RoleAdmin (full access) or RoleOperator (terminals of the
+	// machines in the groups assigned to the account, nothing else).
+	Role string `json:"role"`
 }
+
+const (
+	RoleAdmin    = "admin"
+	RoleOperator = "operator"
+)
+
+// IsAdmin reports whether the account has full access.
+func (a *Admin) IsAdmin() bool { return a.Role == RoleAdmin }
 
 // MinPasswordLength is the shortest accepted admin password.
 const MinPasswordLength = 8
@@ -30,25 +40,7 @@ func (s *Store) CountAdmins() (int, error) {
 // CreateAdmin adds an administrator. mustChange marks the password as
 // temporary, forcing a change on first login.
 func (s *Store) CreateAdmin(username, password string, mustChange bool) (*Admin, error) {
-	username = strings.TrimSpace(username)
-	if username == "" || len(password) < MinPasswordLength {
-		return nil, ErrInvalid
-	}
-	hash, err := bcrypt.GenerateFromPassword([]byte(password), BcryptCost)
-	if err != nil {
-		return nil, err
-	}
-	now := time.Now()
-	res, err := s.db.Exec(`INSERT INTO admins(username, password_hash, created_at, must_change_password) VALUES(?,?,?,?)`,
-		username, string(hash), unix(now), boolInt(mustChange))
-	if err != nil {
-		if isUnique(err) {
-			return nil, ErrConflict
-		}
-		return nil, err
-	}
-	id, _ := res.LastInsertId()
-	return &Admin{ID: id, Username: username, CreatedAt: now.UTC(), MustChangePassword: mustChange}, nil
+	return s.CreateUser(username, password, RoleAdmin, nil, mustChange)
 }
 
 func boolInt(b bool) int {
@@ -65,8 +57,8 @@ func (s *Store) VerifyAdmin(username, password string) (*Admin, error) {
 	var a Admin
 	var hash string
 	var created, mustChange int64
-	err := s.db.QueryRow(`SELECT id, username, password_hash, created_at, must_change_password FROM admins WHERE username = ?`, username).
-		Scan(&a.ID, &a.Username, &hash, &created, &mustChange)
+	err := s.db.QueryRow(`SELECT id, username, password_hash, created_at, must_change_password, role FROM admins WHERE username = ?`, username).
+		Scan(&a.ID, &a.Username, &hash, &created, &mustChange, &a.Role)
 	if errors.Is(err, sql.ErrNoRows) {
 		_ = bcrypt.CompareHashAndPassword(dummyHash, []byte(password))
 		return nil, ErrInvalidCredentials
@@ -151,10 +143,10 @@ func (s *Store) LookupWebSession(token string) (*Admin, error) {
 	var a Admin
 	var created, mustChange int64
 	err := s.db.QueryRow(`
-		SELECT a.id, a.username, a.created_at, a.must_change_password FROM web_sessions w
+		SELECT a.id, a.username, a.created_at, a.must_change_password, a.role FROM web_sessions w
 		JOIN admins a ON a.id = w.admin_id
 		WHERE w.token_hash = ? AND w.expires_at > ?`, HashToken(token), unix(time.Now())).
-		Scan(&a.ID, &a.Username, &created, &mustChange)
+		Scan(&a.ID, &a.Username, &created, &mustChange, &a.Role)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}

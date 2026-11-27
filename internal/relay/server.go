@@ -2,6 +2,7 @@ package relay
 
 import (
 	"crypto/subtle"
+	"encoding/json"
 	"errors"
 	"log"
 	"net/http"
@@ -80,6 +81,18 @@ type session struct {
 	agentID string // machine the session was opened for; "" = any (legacy)
 	conns   []*websocket.Conn
 	timer   *time.Timer
+	tap     Tap // optional observer of a web terminal session
+}
+
+// Tap observes the traffic of a session opened with OpenTerminal, e.g. to
+// record it. Output receives what the shell printed (agent to browser) and
+// Resize the terminal size the browser reports. Calls come from two
+// goroutines, so implementations must be safe for concurrent use. Close is
+// called once, after the session ended and no more calls will follow.
+type Tap interface {
+	Output(data []byte)
+	Resize(cols, rows int)
+	Close()
 }
 
 func New(config Config) *Server {
@@ -290,7 +303,8 @@ var ErrAgentOffline = errors.New("agent offline")
 // OpenTerminal asks the agent for machineID to start a session and attaches
 // conn (an already upgraded WebSocket, e.g. a browser terminal) as the first
 // end. The relay owns conn from here on; the agent joins as the second end.
-func (s *Server) OpenTerminal(machineID string, conn *websocket.Conn) (string, error) {
+// tap, when not nil, observes the session once the agent joins.
+func (s *Server) OpenTerminal(machineID string, conn *websocket.Conn, tap Tap) (string, error) {
 	s.mu.Lock()
 	agent := s.agents[machineID]
 	s.mu.Unlock()
@@ -299,6 +313,7 @@ func (s *Server) OpenTerminal(machineID string, conn *websocket.Conn) (string, e
 	}
 	conn.SetReadLimit(maxMessageSize)
 	state := s.createSession(machineID)
+	state.tap = tap
 	s.mu.Lock()
 	state.conns = append(state.conns, conn)
 	s.mu.Unlock()
@@ -442,11 +457,13 @@ func (s *Server) sessionHandler(w http.ResponseWriter, r *http.Request) {
 
 	if pair[0] != nil {
 		s.logger.Printf("[server] sessão pareada | session=%s", id)
-		go s.bridgePair(id, pair[0], pair[1])
+		go s.bridgePair(id, pair[0], pair[1], state.tap)
 	}
 }
 
-func (s *Server) bridgePair(id string, a, b *websocket.Conn) {
+// bridgePair relays a (the first end: the browser for web sessions) and b (the
+// agent). tap, when set, sees b's output and a's resize requests.
+func (s *Server) bridgePair(id string, a, b *websocket.Conn, tap Tap) {
 	var once sync.Once
 	closePair := func() {
 		once.Do(func() {
@@ -468,12 +485,30 @@ func (s *Server) bridgePair(id string, a, b *websocket.Conn) {
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
-	go func() { defer wg.Done(); defer closePair(); s.relayMessages(a, b) }()
-	go func() { defer wg.Done(); defer closePair(); s.relayMessages(b, a) }()
+	var onFromA, onFromB func(messageType int, data []byte)
+	if tap != nil {
+		defer tap.Close()
+		onFromA = func(messageType int, data []byte) {
+			if messageType != websocket.TextMessage {
+				return
+			}
+			var msg protocol.Message
+			if json.Unmarshal(data, &msg) == nil && msg.Type == protocol.TypeResize && msg.Cols > 0 && msg.Rows > 0 {
+				tap.Resize(int(msg.Cols), int(msg.Rows))
+			}
+		}
+		onFromB = func(messageType int, data []byte) {
+			if messageType == websocket.BinaryMessage {
+				tap.Output(data)
+			}
+		}
+	}
+	go func() { defer wg.Done(); defer closePair(); s.relayMessages(a, b, onFromA) }()
+	go func() { defer wg.Done(); defer closePair(); s.relayMessages(b, a, onFromB) }()
 	wg.Wait()
 }
 
-func (s *Server) relayMessages(src, dst *websocket.Conn) {
+func (s *Server) relayMessages(src, dst *websocket.Conn, observe func(messageType int, data []byte)) {
 	for {
 		messageType, data, err := src.ReadMessage()
 		if err != nil {
@@ -481,6 +516,9 @@ func (s *Server) relayMessages(src, dst *websocket.Conn) {
 			return
 		}
 		s.extendReadDeadline(src)
+		if observe != nil {
+			observe(messageType, data)
+		}
 		_ = dst.SetWriteDeadline(time.Now().Add(writeTimeout))
 		if err := dst.WriteMessage(messageType, data); err != nil {
 			return

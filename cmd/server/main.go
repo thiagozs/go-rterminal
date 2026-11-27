@@ -12,6 +12,7 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
+	"path/filepath"
 	"strings"
 	"syscall"
 	"time"
@@ -20,6 +21,7 @@ import (
 	"github.com/thiagozs/go-rterminal/internal/admin"
 	"github.com/thiagozs/go-rterminal/internal/auth"
 	"github.com/thiagozs/go-rterminal/internal/protocol"
+	"github.com/thiagozs/go-rterminal/internal/recording"
 	"github.com/thiagozs/go-rterminal/internal/relay"
 	"github.com/thiagozs/go-rterminal/internal/store"
 )
@@ -47,6 +49,10 @@ func main() {
 	rootCmd.Flags().String("public-url", "", "URL publica do server (ex: https://rt.exemplo.com), usada nos comandos gerados")
 	rootCmd.Flags().String("admin-user", "admin", "Usuario do primeiro administrador (criado quando o banco nao tem nenhum)")
 	rootCmd.Flags().String("agents-dir", os.Getenv("RTERMINAL_AGENTS_DIR"), "Pasta com os binarios agent-<os>-<arch> que o server distribui em /download/agent/ (padrao: $RTERMINAL_AGENTS_DIR)")
+	rootCmd.Flags().Bool("recordings", true, "Grava as sessoes do terminal web para reproduzir na auditoria (so com --db)")
+	rootCmd.Flags().String("recordings-dir", "", "Pasta das gravacoes (padrao: a pasta \"recordings\" ao lado do --db)")
+	rootCmd.Flags().Int("recordings-max-mb", 50, "Tamanho maximo de uma gravacao; a sessao e cortada com um aviso ao passar")
+	rootCmd.Flags().Int("recordings-retention-days", 90, "Apaga gravacoes mais antigas que isso (0 = guarda para sempre)")
 	rootCmd.Flags().StringSlice("trusted-proxies", nil, "CIDRs de proxies confiaveis cujo X-Forwarded-For vale (ex: 172.16.0.0/12 para o nginx-proxy em Docker)")
 
 	resetCmd := &cobra.Command{
@@ -72,6 +78,13 @@ func runServer(cmd *cobra.Command, _ []string) error {
 	adminUser, _ := cmd.Flags().GetString("admin-user")
 	agentsDir, _ := cmd.Flags().GetString("agents-dir")
 	proxyCIDRs, _ := cmd.Flags().GetStringSlice("trusted-proxies")
+	recordSessions, _ := cmd.Flags().GetBool("recordings")
+	recordingsDir, _ := cmd.Flags().GetString("recordings-dir")
+	recordingsMaxMB, _ := cmd.Flags().GetInt("recordings-max-mb")
+	retentionDays, _ := cmd.Flags().GetInt("recordings-retention-days")
+	if recordingsMaxMB < 1 || retentionDays < 0 {
+		return fmt.Errorf("recordings-max-mb deve ser >= 1 e recordings-retention-days >= 0")
+	}
 	trustedProxies, err := parseCIDRs(proxyCIDRs)
 	if err != nil {
 		return err
@@ -131,8 +144,25 @@ func runServer(cmd *cobra.Command, _ []string) error {
 				log.Printf("[server] falha ao registrar conexão | agent=%s err=%v", id, err)
 			}
 		}
+		var recordings *recording.Manager
+		if recordSessions {
+			if recordingsDir == "" {
+				recordingsDir = filepath.Join(filepath.Dir(dbPath), "recordings")
+			}
+			recordings, err = recording.NewManager(recordingsDir, st, int64(recordingsMaxMB)<<20, nil)
+			if err != nil {
+				return err
+			}
+			recordings.Recover()
+			done := make(chan struct{})
+			defer close(done)
+			go purgeRecordings(recordings, retentionDays, done)
+			log.Printf("[server] gravação de sessões ativa em %s (limite %d MB por sessão, retenção %s)", recordingsDir, recordingsMaxMB, retentionText(retentionDays))
+		} else {
+			log.Printf("[server] gravação de sessões desativada")
+		}
 		relayServer := relay.New(relayConfig)
-		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version})
+		panel := admin.New(admin.Config{Store: st, Relay: relayServer, PublicURL: publicURL, TrustedProxies: trustedProxies, AgentsDir: agentsDir, Version: version, Recordings: recordings})
 		logAgentDownloads(agentsDir)
 
 		mux := http.NewServeMux()
@@ -181,6 +211,39 @@ func runServer(cmd *cobra.Command, _ []string) error {
 		return fmt.Errorf("encerrar server: %w", err)
 	}
 	return nil
+}
+
+func retentionText(days int) string {
+	if days == 0 {
+		return "indefinida"
+	}
+	return fmt.Sprintf("%d dias", days)
+}
+
+// purgeRecordings applies the retention period now and every six hours.
+func purgeRecordings(m *recording.Manager, days int, done <-chan struct{}) {
+	if days == 0 {
+		return
+	}
+	run := func() {
+		n, err := m.Purge(time.Now().AddDate(0, 0, -days))
+		if err != nil {
+			log.Printf("[server] falha ao aplicar retenção das gravações: %v", err)
+		} else if n > 0 {
+			log.Printf("[server] %d gravações antigas apagadas (retenção de %d dias)", n, days)
+		}
+	}
+	run()
+	ticker := time.NewTicker(6 * time.Hour)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			run()
+		case <-done:
+			return
+		}
+	}
 }
 
 func displayURL(addr string, tls bool, publicURL string) string {

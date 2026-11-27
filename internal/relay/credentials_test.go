@@ -143,7 +143,7 @@ func TestOpenTerminalPairsBrowserWithAgent(t *testing.T) {
 		if err != nil {
 			return
 		}
-		if _, err := relay.OpenTerminal("machine-a", conn); err != nil {
+		if _, err := relay.OpenTerminal("machine-a", conn, nil); err != nil {
 			t.Errorf("OpenTerminal: %v", err)
 		}
 		browserSide <- conn
@@ -194,7 +194,7 @@ func TestOpenTerminalPairsBrowserWithAgent(t *testing.T) {
 func TestOpenTerminalOfflineAgent(t *testing.T) {
 	t.Parallel()
 	relay, _ := newCredentialServer(t, &hookLog{})
-	if _, err := relay.OpenTerminal("machine-a", nil); err != ErrAgentOffline {
+	if _, err := relay.OpenTerminal("machine-a", nil, nil); err != ErrAgentOffline {
 		t.Fatalf("err = %v, want ErrAgentOffline", err)
 	}
 }
@@ -215,5 +215,82 @@ func TestSharedTokenStillOpensClientsInCredentialMode(t *testing.T) {
 		if resp.StatusCode != want {
 			t.Errorf("token %q: status %d, want %d", token, resp.StatusCode, want)
 		}
+	}
+}
+
+type tapLog struct {
+	mu      sync.Mutex
+	out     []byte
+	resizes [][2]int
+	closed  int
+}
+
+func (l *tapLog) Output(d []byte) { l.mu.Lock(); l.out = append(l.out, d...); l.mu.Unlock() }
+func (l *tapLog) Resize(c, r int) {
+	l.mu.Lock()
+	l.resizes = append(l.resizes, [2]int{c, r})
+	l.mu.Unlock()
+}
+func (l *tapLog) Close() { l.mu.Lock(); l.closed++; l.mu.Unlock() }
+
+// The tap sees what the agent prints and the browser's resizes, never what the
+// browser types, and is closed exactly once when the session ends.
+func TestTapSeesOutputAndResizeButNotInput(t *testing.T) {
+	t.Parallel()
+	relay, server := newCredentialServer(t, &hookLog{})
+	agent := registerAs(t, server.URL, "tok-a", protocol.Message{Type: protocol.TypeRegisterAgent})
+	waitFor(t, "online", func() bool { return relay.IsOnline("machine-a") })
+
+	tap := &tapLog{}
+	adminSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := (&websocket.Upgrader{}).Upgrade(w, r, nil)
+		if err != nil {
+			return
+		}
+		if _, err := relay.OpenTerminal("machine-a", conn, tap); err != nil {
+			t.Errorf("OpenTerminal: %v", err)
+		}
+	}))
+	defer adminSrv.Close()
+	browser, _, err := websocket.DefaultDialer.Dial("ws"+strings.TrimPrefix(adminSrv.URL, "http"), nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer browser.Close()
+
+	var start protocol.Message
+	_ = agent.SetReadDeadline(time.Now().Add(2 * time.Second))
+	if err := agent.ReadJSON(&start); err != nil {
+		t.Fatal(err)
+	}
+	session := dialWebSocket(t, server.URL, "/session?id="+url.QueryEscape(start.SessionID), "tok-a")
+	for _, conn := range []*websocket.Conn{browser, session} {
+		var notice protocol.Message
+		if err := conn.ReadJSON(&notice); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_ = browser.WriteJSON(protocol.Message{Type: protocol.TypeResize, Cols: 100, Rows: 30})
+	_ = browser.WriteMessage(websocket.BinaryMessage, []byte("secret-typed\n"))
+	for i := 0; i < 2; i++ { // the agent still receives both the resize and the typed text
+		if _, _, err := session.ReadMessage(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	_ = session.WriteMessage(websocket.BinaryMessage, []byte("hello\r\n"))
+	if _, got, _ := browser.ReadMessage(); string(got) != "hello\r\n" {
+		t.Fatalf("browser got %q", got)
+	}
+	session.Close()
+
+	waitFor(t, "tap closed", func() bool { tap.mu.Lock(); defer tap.mu.Unlock(); return tap.closed == 1 })
+	tap.mu.Lock()
+	defer tap.mu.Unlock()
+	if string(tap.out) != "hello\r\n" {
+		t.Errorf("tap output = %q, want only the shell output", tap.out)
+	}
+	if len(tap.resizes) != 1 || tap.resizes[0] != [2]int{100, 30} {
+		t.Errorf("tap resizes = %v", tap.resizes)
 	}
 }
