@@ -255,7 +255,7 @@ func (c agentConfig) capabilities() []string {
 		caps = append(caps, protocol.CapSelfUpdate)
 	}
 	if !c.noFiles && (c.identity == nil || fileIdentitySupported) {
-		caps = append(caps, protocol.CapFiles)
+		caps = append(caps, protocol.CapFiles, protocol.CapFilesManage, protocol.CapFilesCopy)
 	}
 	return caps
 }

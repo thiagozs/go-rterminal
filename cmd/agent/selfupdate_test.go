@@ -364,3 +364,63 @@ func TestSelfUpdateNotAdvertisedWhenBinaryFolderIsReadOnly(t *testing.T) {
 		t.Fatalf("events = %v", k)
 	}
 }
+
+// A link that stalls halfway must not fail the update: the agent gives up on
+// the silent connection and continues from where it stopped.
+func TestDownloadResumesAfterStall(t *testing.T) {
+	payload := make([]byte, 300<<10)
+	for i := range payload {
+		payload[i] = byte(i * 7)
+	}
+	old, oldBackoff := downloadStall, downloadBackoff
+	downloadStall, downloadBackoff = 300*time.Millisecond, 10*time.Millisecond
+	t.Cleanup(func() { downloadStall, downloadBackoff = old, oldBackoff })
+
+	var requests atomic.Int32
+	var ranges []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		n := requests.Add(1)
+		ranges = append(ranges, r.Header.Get("Range"))
+		if n == 1 { // first connection: half the file, then silence
+			w.Header().Set("Content-Length", "307200")
+			w.Header().Set("Last-Modified", "Fri, 27 Nov 2026 10:00:00 GMT")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write(payload[:150<<10])
+			w.(http.Flusher).Flush()
+			<-r.Context().Done()
+			return
+		}
+		http.ServeContent(w, r, "agent", time.Date(2026, 11, 27, 10, 0, 0, 0, time.UTC), strings.NewReader(string(payload)))
+	}))
+	t.Cleanup(srv.Close)
+
+	out, err := os.CreateTemp(t.TempDir(), "dl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer out.Close()
+	if err := fetchResumable(context.Background(), srv.Client(), srv.URL, "x", out); err != nil {
+		t.Fatalf("fetchResumable: %v", err)
+	}
+	got, _ := os.ReadFile(out.Name())
+	if string(got) != string(payload) {
+		t.Fatalf("downloaded %d bytes, want %d identical", len(got), len(payload))
+	}
+	if requests.Load() != 2 || ranges[1] != "bytes=153600-" {
+		t.Fatalf("requests=%d ranges=%q, want a resume from byte 153600", requests.Load(), ranges)
+	}
+}
+
+func TestDownloadGivesUpOnClientErrors(t *testing.T) {
+	var requests atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		requests.Add(1)
+		http.Error(w, "no", http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	out, _ := os.CreateTemp(t.TempDir(), "dl")
+	defer out.Close()
+	if err := fetchResumable(context.Background(), srv.Client(), srv.URL, "x", out); err == nil || requests.Load() != 1 {
+		t.Fatalf("err=%v requests=%d, a 404 must fail at once", err, requests.Load())
+	}
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"archive/zip"
 	"bytes"
 	"io"
 	"net/http"
@@ -274,4 +275,80 @@ func TestFileCredentialsDoNotLeakToOtherWork(t *testing.T) {
 			t.Fatalf("iteration %d: a root file session was downgraded: %+v", i, m)
 		}
 	}
+}
+
+// Deleting, moving and archiving obey the chosen account's permissions too.
+func TestFileManagementRunsAsTheChosenUser(t *testing.T) {
+	if runtime.GOOS != "linux" {
+		t.Skip("linux only")
+	}
+	id := rootIdentity(t)
+	c := newFileClientAs(t, id)
+	home := id.home
+
+	// What the account may not touch is refused, although the agent is root.
+	c.send(protocol.FileMessage{Op: protocol.OpRm, Path: "/etc/hostname"})
+	c.wantError("sem permissão")
+	if _, err := os.Stat("/etc/hostname"); err != nil {
+		t.Fatal("the agent deleted /etc/hostname as root")
+	}
+	c.send(protocol.FileMessage{Op: protocol.OpMv, Path: "/etc/hostname", To: "/etc/hostname.moved"})
+	c.wantError("sem permissão")
+	if _, err := os.Stat("/etc/hostname.moved"); err == nil {
+		t.Fatal("the agent moved a file inside /etc as root")
+	}
+
+	// A zip of a system folder leaves out what the account cannot read.
+	c.send(protocol.FileMessage{Op: protocol.OpZip, Paths: []string{"/etc"}})
+	if m := c.reply(); m.Op != protocol.OpZip {
+		t.Fatalf("zip /etc = %+v", m)
+	}
+	var data []byte
+	var end protocol.FileMessage
+	for {
+		kind, frame := c.frame()
+		if kind == websocket.BinaryMessage {
+			data = append(data, frame...)
+			continue
+		}
+		_ = jsonUnmarshal(frame, &end)
+		break
+	}
+	zr, err := zip.NewReader(bytes.NewReader(data), int64(len(data)))
+	if err != nil {
+		t.Fatalf("not a zip: %v", err)
+	}
+	for _, f := range zr.File {
+		if f.Name == "etc/shadow" {
+			t.Fatal("/etc/shadow was archived by a root agent for an unprivileged account")
+		}
+	}
+	if end.Op != protocol.OpDone || end.Skipped == 0 {
+		t.Fatalf("end = %+v, want some unreadable items skipped", end)
+	}
+
+	// Inside its own home everything works, and what it creates is its own.
+	work := filepath.Join(home, "work")
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: filepath.Join(work, "sub"), Parents: true})
+	if m := c.reply(); m.Op != protocol.OpDone {
+		t.Fatalf("mkdir = %+v", m)
+	}
+	c.send(protocol.FileMessage{Op: protocol.OpMv, Path: filepath.Join(work, "sub"), To: filepath.Join(work, "renamed")})
+	if m := c.reply(); m.Op != protocol.OpDone {
+		t.Fatalf("mv = %+v", m)
+	}
+	st, err := os.Stat(filepath.Join(work, "renamed"))
+	if err != nil || st.Sys().(*syscall.Stat_t).Uid != id.uid {
+		t.Fatalf("renamed folder: %v %v", st, err)
+	}
+	c.send(protocol.FileMessage{Op: protocol.OpRm, Path: work, Recursive: true})
+	if m := c.reply(); m.Op != protocol.OpDone {
+		t.Fatalf("rm -r = %+v", m)
+	}
+	if _, err := os.Stat(work); err == nil {
+		t.Fatal("folder still there")
+	}
+	// The account's home itself is protected.
+	c.send(protocol.FileMessage{Op: protocol.OpRm, Path: home, Recursive: true})
+	c.wantError("protegida")
 }

@@ -173,10 +173,17 @@ a.btn { text-decoration: none; display: inline-block; }
 .xfer-foot .linklike { margin-left: auto; }
 @media (max-width: 640px) { .xfer { grid-template-columns: 1fr 90px; } .xfer .bar { grid-column: 1 / -1; order: 3; } }
 .bar { height: 8px; background: var(--ink); border-radius: 4px; overflow: hidden; }
-.bar-fill { height: 100%; width: 0; background: var(--sky); transition: width .1s; }
+.bar-fill { height: 100%; width: 0; background: var(--sky); transition: width .25s ease-out; }
 .bar-fill.ok { background: var(--green); }
 .bar-fill.bad { background: var(--red); }
 .error-text { color: var(--orange); }
+
+.files-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin: 0 0 8px; padding: 6px 10px; background: var(--navy); border-radius: 6px; }
+.files-table .sel { width: 34px; padding-right: 0; }
+.files-table input[type=checkbox] { width: auto; }
+.files-table tr:has(input:checked) td { background: rgba(65, 166, 246, .12); }
+.del-list { margin: 8px 0; padding-left: 20px; max-height: 180px; overflow: auto; }
+.modal .check { margin: 6px 0; }
 
 /* historico da maquina */
 .modal:has(.history) { width: min(960px, 100%); }
@@ -209,3 +216,18 @@ a.btn { text-decoration: none; display: inline-block; }
   .main { padding: 14px; }
 }
 @media (max-width: 760px) { .content { grid-template-columns: 1fr; } .sidebar { border-right: none; border-bottom: 1px solid var(--dusk); } }
+
+.files-table tr.drop-into td { background: rgba(65, 166, 246, .28); }
+.files-table tr.drop-into { outline: 2px dashed #41a6f6; outline-offset: -2px; }
+.files-table tr[draggable="true"] { cursor: grab; }
+.files-toolbar .btn.drop-into { outline: 2px dashed #41a6f6; }
+
+/* Motion: soft status changes, and none of it when the system asks for less. */
+.dot { transition: background-color .3s, box-shadow .3s; }
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { transition: none !important; animation: none !important; }
+}
+
+/* Press feedback. */
+.btn:not(:disabled):active, .menu-item:active { transform: scale(.97); }
+.btn, .menu-item { transition: background-color .12s, border-color .12s, transform .08s; }

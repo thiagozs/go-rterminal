@@ -150,20 +150,7 @@ func downloadAgent(ctx context.Context, config agentConfig, tlsConfig *tls.Confi
 	case strings.HasPrefix(endpointURL, "ws://"):
 		endpointURL = "http://" + strings.TrimPrefix(endpointURL, "ws://")
 	}
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpointURL, nil)
-	if err != nil {
-		return "", err
-	}
-	auth.SetAuthorization(req.Header, config.authToken)
 	client := &http.Client{Transport: &http.Transport{TLSClientConfig: tlsConfig}}
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("baixar: %w", err)
-	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("o servidor respondeu HTTP %d ao baixar o agent", resp.StatusCode)
-	}
 	tmp, err := os.CreateTemp(dir, ".agent-update-*")
 	if err != nil {
 		return "", fmt.Errorf("sem permissão para gravar em %s: %w", dir, errors.Unwrap(err))
@@ -175,10 +162,17 @@ func downloadAgent(ctx context.Context, config agentConfig, tlsConfig *tls.Confi
 			os.Remove(tmp.Name())
 		}
 	}()
+	if err := fetchResumable(ctx, client, endpointURL, config.authToken, tmp); err != nil {
+		return "", err
+	}
+	// The checksum covers the whole file, however many attempts it took.
+	if _, err := tmp.Seek(0, io.SeekStart); err != nil {
+		return "", err
+	}
 	hash := sha256.New()
-	n, err := io.Copy(io.MultiWriter(tmp, hash), io.LimitReader(resp.Body, maxBinaryBytes+1))
+	n, err := io.Copy(hash, io.LimitReader(tmp, maxBinaryBytes+1))
 	if err != nil {
-		return "", fmt.Errorf("baixar: %w", err)
+		return "", fmt.Errorf("ler o binário baixado: %w", err)
 	}
 	if n > maxBinaryBytes {
 		return "", errors.New("o binário baixado é grande demais")
@@ -318,7 +312,7 @@ func (u *updater) run(ctx context.Context, config agentConfig, msg protocol.Mess
 	}
 	log.Printf("[agent] atualizando para %s", msg.Version)
 	u.journal.Record("update_started", fmt.Sprintf("atualizando de %s para %s", version, msg.Version))
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Minute)
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Minute)
 	defer cancel()
 	tmp, err := downloadAgent(ctx, config, tlsConfig, filepath.Dir(u.exe), strings.ToLower(msg.SHA256))
 	if err != nil {
@@ -338,4 +332,110 @@ func (u *updater) run(ctx context.Context, config agentConfig, msg protocol.Mess
 	u.journal.Record("agent_stop", "reiniciando para concluir a atualização para "+msg.Version)
 	report() // deliver the events before the process goes away
 	u.exit(0)
+}
+
+// Download tuning; tests shorten these.
+var (
+	downloadStall   = 20 * time.Second // no bytes for this long: give up on the connection
+	downloadBackoff = 2 * time.Second  // pause before a retry, times the attempt number
+)
+
+const maxDownloadTries = 8
+
+// errFatalDownload marks a failure that retrying cannot fix.
+type errFatalDownload struct{ error }
+
+// fetchResumable downloads url into out, continuing from where a broken or
+// stalled connection stopped (Range) instead of starting over. A flaky link
+// (Wi-Fi, a path that drops big packets) often lets a WebSocket live yet
+// stalls a 9 MB transfer until the kernel gives up minutes later; a stall
+// timer plus resuming turns that into a short pause.
+func fetchResumable(ctx context.Context, client *http.Client, url, token string, out *os.File) error {
+	var offset int64
+	var lastModified string
+	var lastErr error
+	for attempt := 1; attempt <= maxDownloadTries; attempt++ {
+		if attempt > 1 {
+			log.Printf("[agent] download do agent interrompido (%v); retomando em %d bytes (tentativa %d de %d)", lastErr, offset, attempt, maxDownloadTries)
+			select {
+			case <-time.After(time.Duration(attempt-1) * downloadBackoff):
+			case <-ctx.Done():
+				return fmt.Errorf("baixar: %w", ctx.Err())
+			}
+		}
+		err := fetchChunk(ctx, client, url, token, out, &offset, &lastModified)
+		if err == nil {
+			return nil
+		}
+		var fatal errFatalDownload
+		if errors.As(err, &fatal) || ctx.Err() != nil {
+			return fmt.Errorf("baixar: %w", err)
+		}
+		lastErr = err
+	}
+	return fmt.Errorf("baixar: desisti depois de %d tentativas: %w", maxDownloadTries, lastErr)
+}
+
+// fetchChunk makes one request, appending to out and advancing *offset as bytes arrive.
+func fetchChunk(ctx context.Context, client *http.Client, url, token string, out *os.File, offset *int64, lastModified *string) error {
+	attemptCtx, cancel := context.WithCancel(ctx)
+	defer cancel()
+	stall := time.AfterFunc(downloadStall, cancel)
+	defer stall.Stop()
+
+	req, err := http.NewRequestWithContext(attemptCtx, http.MethodGet, url, nil)
+	if err != nil {
+		return errFatalDownload{err}
+	}
+	auth.SetAuthorization(req.Header, token)
+	if *offset > 0 {
+		req.Header.Set("Range", fmt.Sprintf("bytes=%d-", *offset))
+		if *lastModified != "" {
+			req.Header.Set("If-Range", *lastModified) // the binary changed meanwhile: get all of it again
+		}
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+	switch {
+	case resp.StatusCode == http.StatusPartialContent && *offset > 0 &&
+		strings.HasPrefix(resp.Header.Get("Content-Range"), fmt.Sprintf("bytes %d-", *offset)):
+		// continuing
+	case resp.StatusCode == http.StatusOK:
+		// Everything from the start (first attempt, or the server ignored Range).
+		if err := out.Truncate(0); err != nil {
+			return errFatalDownload{err}
+		}
+		*offset = 0
+		*lastModified = resp.Header.Get("Last-Modified")
+	case resp.StatusCode >= 500 || resp.StatusCode == http.StatusTooManyRequests:
+		return fmt.Errorf("o servidor respondeu HTTP %d", resp.StatusCode)
+	default:
+		return errFatalDownload{fmt.Errorf("o servidor respondeu HTTP %d ao baixar o agent", resp.StatusCode)}
+	}
+	if _, err := out.Seek(*offset, io.SeekStart); err != nil {
+		return errFatalDownload{err}
+	}
+	buf := make([]byte, 32<<10)
+	for {
+		n, rerr := resp.Body.Read(buf)
+		if n > 0 {
+			stall.Reset(downloadStall)
+			if _, werr := out.Write(buf[:n]); werr != nil {
+				return errFatalDownload{werr}
+			}
+			*offset += int64(n)
+			if *offset > maxBinaryBytes {
+				return errFatalDownload{errors.New("o binário baixado é grande demais")}
+			}
+		}
+		if rerr == io.EOF {
+			return nil
+		}
+		if rerr != nil {
+			return rerr
+		}
+	}
 }

@@ -251,3 +251,109 @@ func TestFileTransferCanBeDisabled(t *testing.T) {
 		t.Fatalf("me = %s", body)
 	}
 }
+
+func TestCreatingAFolderThatExistsIsNotAFailure(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.login()
+	m := e.createMachine("pi")
+	ch := e.openFileChannel("pi", m.Credential)
+
+	// Sending a folder tree again finds its folders already there.
+	_ = ch.browser.WriteJSON(protocol.FileMessage{Op: protocol.OpMkdir, Path: "/srv/projeto", Parents: true})
+	ch.readOp(ch.agent)
+	_ = ch.agent.WriteJSON(protocol.FileMessage{Op: protocol.OpError, Error: "já existe", Code: protocol.CodeExists})
+	ch.readOp(ch.browser)
+
+	// A real refusal is still audited.
+	_ = ch.browser.WriteJSON(protocol.FileMessage{Op: protocol.OpMkdir, Path: "/etc/nope"})
+	ch.readOp(ch.agent)
+	_ = ch.agent.WriteJSON(protocol.FileMessage{Op: protocol.OpError, Error: "sem permissão"})
+	ch.readOp(ch.browser)
+	// A file that exists only makes the panel ask whether to replace it: not a failure either.
+	_ = ch.browser.WriteJSON(protocol.FileMessage{Op: protocol.OpPut, Path: "/srv/a.txt", Size: 1})
+	ch.readOp(ch.agent)
+	_ = ch.agent.WriteJSON(protocol.FileMessage{Op: protocol.OpError, Error: "já existe", Code: protocol.CodeExists})
+	ch.readOp(ch.browser)
+
+	e.auditContains(t, "file_failed", "/etc/nope", "sem permissão")
+	_, audit := e.do("GET", "/api/audit", nil)
+	if strings.Contains(string(audit), "/srv/a.txt") {
+		t.Fatalf("a replace prompt was audited as a failure: %s", audit)
+	}
+	if strings.Contains(string(audit), "/srv/projeto") {
+		t.Fatalf("an existing folder was audited as a failure: %s", audit)
+	}
+}
+
+func TestDeleteRenameAndZipAreAudited(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t, func(c *Config) { c.MaxTransferBytes = 1 << 20 })
+	e.login()
+	m := e.createMachine("pi")
+	ch := e.openFileChannel("pi", m.Credential)
+
+	roundTrip := func(op protocol.FileMessage, reply protocol.FileMessage) {
+		t.Helper()
+		_ = ch.browser.WriteJSON(op)
+		ch.readOp(ch.agent)
+		_ = ch.agent.WriteJSON(reply)
+		ch.readOp(ch.browser)
+	}
+	roundTrip(protocol.FileMessage{Op: protocol.OpRm, Path: "/srv/old", Recursive: true}, protocol.FileMessage{Op: protocol.OpDone})
+	roundTrip(protocol.FileMessage{Op: protocol.OpRm, Path: "/srv/one.txt"}, protocol.FileMessage{Op: protocol.OpDone})
+	roundTrip(protocol.FileMessage{Op: protocol.OpMv, Path: "/srv/a.txt", To: "/srv/b.txt"}, protocol.FileMessage{Op: protocol.OpDone})
+	roundTrip(protocol.FileMessage{Op: protocol.OpCp, Path: "/srv/a.txt", To: "/srv/sub/a.txt"}, protocol.FileMessage{Op: protocol.OpDone})
+	roundTrip(protocol.FileMessage{Op: protocol.OpRm, Path: "/etc"}, protocol.FileMessage{Op: protocol.OpError, Error: "esta pasta é protegida"})
+	e.auditContains(t, "file_delete", "/srv/old (recursive)")
+	e.auditContains(t, "file_delete", "/srv/one.txt")
+	e.auditContains(t, "file_rename", "/srv/a.txt -\\u003e /srv/b.txt")
+	e.auditContains(t, "file_copy", "/srv/a.txt -\\u003e /srv/sub/a.txt")
+	e.auditContains(t, "file_failed", "rm /etc", "protegida")
+
+	// A zip is a download: the audit lists what was archived and how much really passed.
+	_ = ch.browser.WriteJSON(protocol.FileMessage{Op: protocol.OpZip, Paths: []string{"/srv/a", "/srv/b"}})
+	ch.readOp(ch.agent)
+	_ = ch.agent.WriteJSON(protocol.FileMessage{Op: protocol.OpZip})
+	_ = ch.agent.WriteMessage(websocket.BinaryMessage, []byte("12345"))
+	_ = ch.agent.WriteJSON(protocol.FileMessage{Op: protocol.OpDone, Bytes: 5, Skipped: 2})
+	ch.readOp(ch.browser)
+	ch.read(ch.browser)
+	ch.readOp(ch.browser)
+	e.auditContains(t, "file_download", "zip: /srv/a, /srv/b (5 bytes, 2 items skipped)")
+
+	// The size limit applies to what a zip streams, too.
+	_ = ch.browser.WriteJSON(protocol.FileMessage{Op: protocol.OpZip, Paths: []string{"/srv/huge"}})
+	ch.readOp(ch.agent)
+	_ = ch.agent.WriteJSON(protocol.FileMessage{Op: protocol.OpZip})
+	chunk := make([]byte, 256<<10)
+	for i := 0; i < 8; i++ {
+		if ch.agent.WriteMessage(websocket.BinaryMessage, chunk) != nil {
+			break
+		}
+	}
+	e.auditContains(t, "file_failed", "zip: /srv/huge", "larger than the limit")
+}
+
+func TestMachineViewTellsWhatTheAgentCanManage(t *testing.T) {
+	t.Parallel()
+	e := newEnv(t)
+	e.login()
+	old := e.createMachine("old")
+	e.connectAgent(old.Credential, protocol.Message{Capabilities: []string{protocol.CapFiles}})
+	fresh := e.createMachine("fresh")
+	e.connectAgent(fresh.Credential, protocol.Message{Capabilities: []string{protocol.CapFiles, protocol.CapFilesManage}})
+	waitUntil(t, "both online", func() bool { return e.relay.IsOnline("old") && e.relay.IsOnline("fresh") })
+	_, body := e.do("GET", "/api/machines", nil)
+	var list []machineView
+	if err := json.Unmarshal(body, &list); err != nil {
+		t.Fatal(err)
+	}
+	got := map[string][2]bool{}
+	for _, v := range list {
+		got[v.ID] = [2]bool{v.CanFiles, v.CanFilesManage}
+	}
+	if got["old"] != [2]bool{true, false} || got["fresh"] != [2]bool{true, true} {
+		t.Fatalf("can_files / can_files_manage = %v", got)
+	}
+}

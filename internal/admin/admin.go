@@ -188,6 +188,9 @@ func (s *Server) Handler() http.Handler {
 	mux.HandleFunc("POST /api/2fa/email/disable", s.authedSetup(s.emailDisable))
 	mux.HandleFunc("POST /api/2fa/recovery", s.authedSetup(s.recoveryRegenerate))
 
+	mux.HandleFunc("GET /api/prefs", s.authed(s.getPrefs))
+	mux.HandleFunc("PUT /api/prefs", s.authed(s.putPrefs))
+
 	mux.HandleFunc("GET /api/groups", s.authed(s.listGroups))
 	mux.HandleFunc("POST /api/groups", s.adminOnly(s.createGroup))
 	mux.HandleFunc("PUT /api/groups/{id}", s.adminOnly(s.updateGroup))
@@ -369,6 +372,15 @@ func decode(w http.ResponseWriter, r *http.Request, v any) bool {
 	dec := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes))
 	dec.DisallowUnknownFields()
 	if err := dec.Decode(v); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid JSON body")
+		return false
+	}
+	return true
+}
+
+// decodeLoose is decode for bodies whose keys are checked by the caller.
+func decodeLoose(w http.ResponseWriter, r *http.Request, v any) bool {
+	if err := json.NewDecoder(io.LimitReader(r.Body, maxBodyBytes)).Decode(v); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid JSON body")
 		return false
 	}

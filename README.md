@@ -287,22 +287,28 @@ Condicoes e limites:
 Botao **Arquivos** na linha da maquina (administradores e operadores com acesso a ela). Abre um gerenciador de arquivos da maquina remota:
 
 - **Navegar**: pastas primeiro, tamanho e data; campo de caminho editavel, botao de pasta acima, recarregar e **Nova pasta**.
-- **Baixar**: botao em cada arquivo; o navegador recebe o arquivo em pedacos de 64 KB e salva no fim.
+- **Selecionar** (caixas de selecao, com "selecionar tudo"): aparece uma barra com **Baixar**, **Renomear**, **Mover…**, **Copiar…** e **Excluir**.
+  - **Baixar**: um arquivo baixa direto; uma **pasta** ou **varios itens** viram um unico `.zip`, montado enquanto e enviado (nada fica em memoria nem em disco no agent), com subpastas, pastas vazias, arquivos ocultos, datas e o bit de executavel. O que o usuario nao pode ler fica de fora e o painel avisa quantos itens. Links simbolicos nao entram.
+  - **Renomear**: um item por vez; nunca substitui um nome que ja existe.
+  - **Mover** e **Copiar**: pelos botoes (pedem a pasta de destino) ou **arrastando** as linhas sobre uma pasta da lista (ou sobre o botao ↑, para a pasta acima); segurando **Alt** (ou Ctrl) ao soltar, copia em vez de mover. Nunca substituem o que ja existe no destino. A copia leva pastas inteiras, mantendo permissoes e datas; links simbolicos e arquivos especiais ficam de fora e o painel avisa quantos.
+  - **Excluir**: pede confirmacao e avisa que pastas sao apagadas com tudo o que ha dentro. Links simbolicos sao removidos, nunca seguidos. O agent **recusa** apagar ou mover `/`, as pastas de primeiro nivel (`/etc`, `/usr`, `/home`...) e o home do usuario do terminal.
 - **Enviar**: botao **Enviar arquivos** (varios de uma vez), botao **Enviar pasta** ou **arrastar e soltar** arquivos e pastas sobre a tela, sempre para a pasta aberta.
-- **Pastas inteiras**: uma pasta chega com todas as subpastas e arquivos, **com a mesma estrutura da origem** (`Projeto/docs/img/foto.png` vira `<pasta aberta>/Projeto/docs/img/foto.png`). As pastas intermediarias sao criadas no caminho; ao **arrastar**, as pastas **vazias** tambem chegam (o seletor de pasta do navegador nao informa pastas vazias). Pastas e arquivos novos pertencem ao usuario do terminal.
-- **Arquivo que ja existe**: o painel pergunta **Pular**, **Pular todos**, **Substituir** ou **Substituir todos**, o que evita responder 500 vezes ao reenviar uma pasta. A substituicao mantem as permissoes do arquivo original.
-- **Painel de progresso**: fica fixo perto do rodape, para um arquivo ou muitos. Mostra o total (itens, bytes, velocidade e fila), uma barra geral e uma linha por item com o caminho relativo, a barra e o resultado; erros aparecem em laranja. Tem **Cancelar** (interrompe o que esta no ar e descarta o que falta) e a lista pode ser recolhida.
-- **Fechar sozinho ou manualmente**: ao terminar, o painel pode fechar por conta propria depois de alguns segundos (a contagem pausa se voce passar o mouse). Se algum item falhou ou voce cancelou, ele **nunca** fecha sozinho. A opcao fica no rodape do painel e em **Preferencias** (veja abaixo).
+- **Pastas inteiras**: uma pasta chega com todas as subpastas e arquivos, **com a mesma estrutura da origem** (`Projeto/docs/img/foto.png` vira `<pasta aberta>/Projeto/docs/img/foto.png`). O proprio painel **cria as pastas que faltam**, de cima para baixo, antes de enviar os arquivos (uma que ja existe nao e erro), entao o destino nao precisa existir e funciona com qualquer versao do agent. Ao **arrastar**, as pastas **vazias** tambem chegam (o seletor de pasta do navegador nao informa pastas vazias).
+- **Resumo antes de enviar uma pasta**: mostra quantos arquivos e quantos MB, e deixa **ignorar** `.git`, `node_modules`, `.DS_Store`/`Thumbs.db`/`desktop.ini` e, se quiser, os demais arquivos e pastas **ocultos** (como `.env`), com o total atualizado na hora. Os padroes ficam em **Preferencias**; com o resumo desligado, os padroes sao aplicados sem perguntar (e o painel avisa quantos arquivos ficaram de fora).
+- **Mantidos no envio**: a **data de modificacao** e o **bit de executavel** (o navegador nao informa permissoes, entao o painel reconhece scripts com `#!` e binarios ELF pelos primeiros bytes e os cria como `0755`; o resto, `0644`; opcao em Preferencias). **Links simbolicos e as demais permissoes nao**: o navegador nao as entrega.
+- **Varios ao mesmo tempo**: os arquivos sao enviados por varios canais em paralelo (3 por padrao, de 1 a 6 em Preferencias), o que acelera pastas com muitos arquivos pequenos.
+- **Arquivo que ja existe**: o painel pergunta **Pular**, **Pular todos**, **Substituir** ou **Substituir todos**, uma pergunta por vez mesmo com envios em paralelo. A substituicao mantem as permissoes do arquivo original.
+- **Painel de progresso**: fica fixo perto do rodape, para um item ou muitos (envios, downloads, zips e exclusoes). Mostra o total (itens, bytes, velocidade e fila), uma barra geral e uma linha por item; erros aparecem em laranja. Tem **Cancelar** e a lista pode ser recolhida.
+- **Fechar sozinho ou manualmente**: ao terminar, o painel pode fechar por conta propria depois de alguns segundos (a contagem pausa se voce passar o mouse). Se algum item falhou ou voce cancelou, ele **nunca** fecha sozinho. A opcao fica no rodape do painel e em **Preferencias**.
+- **Download direto para o disco**: arquivos de **64 MB ou mais** e todo `.zip` sao gravados em pedacos no local que voce escolher, sem ocupar memoria (navegadores com a File System Access API: Chrome, Edge e derivados). Nos outros navegadores, e para arquivos menores, o download e montado em memoria e salvo no fim.
 - Se a conexao cair ou voce cancelar no meio de um envio, nada fica pela metade: o agent grava num arquivo temporario ao lado e so renomeia quando chegou tudo.
 
 Como funciona e limites:
 - Tudo trafega por WebSocket (o mesmo canal que o terminal usa), entao nao esbarra no limite de corpo (`client_max_body_size`) do nginx-proxy. O servidor so confere quem pode, audita e aplica o limite de tamanho; o conteudo vai direto do navegador ao agent.
-- O limite (`--max-transfer-mb`, padrao 512 MB) conta os bytes que realmente passaram pelo servidor, nao o tamanho declarado: quem anuncia pouco e manda muito tambem e cortado. O download fica em memoria do navegador ate terminar, entao arquivos muito grandes pesam la.
-- A transferencia roda com as permissoes do **usuario do terminal** da maquina (`--shell-user`; sem ele, as do usuario que roda o agent, que no comando gerado pelo painel sem `--shell-user` e **root**): le e grava o que esse usuario pode, o mesmo alcance do terminal dele, e os arquivos enviados pertencem a ele. A pasta inicial e o home desse usuario.
-- Auditoria: `file_channel` (canal aberto), `file_upload`, `file_download` e `file_mkdir` com o caminho e os bytes, e `file_failed` para o que foi recusado, interrompido ou passou do limite. Listar pastas nao e registrado. Operador fora dos grupos da maquina recebe 404 e fica em `file_denied`.
-- Os itens de uma pasta sao enviados em sequencia, um arquivo por vez: pastas com milhares de arquivos pequenos dependem da latencia ate o servidor.
-- So arquivos comuns sao baixados (nao pastas nem dispositivos). Nao ha exclusao nem renomeacao pelo painel; para isso use o terminal.
-- Exige agent atualizado: agents antigos nao anunciam a funcao e o botao fica desabilitado com a explicacao. Desative por servidor com `--files=false` (`FILE_TRANSFER=false` na stack) ou por maquina com `--no-files` no agent.
+- O limite (`--max-transfer-mb`, padrao 512 MB) conta os bytes que realmente passaram pelo servidor, nao o tamanho declarado: quem anuncia pouco e manda muito tambem e cortado. Vale para cada arquivo enviado ou baixado e para o tamanho total de um `.zip`.
+- A transferencia roda com as permissoes do **usuario do terminal** da maquina (`--shell-user`; sem ele, as do usuario que roda o agent, que no comando gerado pelo painel sem `--shell-user` e **root**): le, grava, renomeia e apaga o que esse usuario pode, o mesmo alcance do terminal dele, e o que voce envia pertence a ele. A pasta inicial e o home desse usuario.
+- Auditoria: `file_channel` (canal aberto; um por canal paralelo), `file_upload`, `file_download` (inclui os `.zip`, com a lista do que foi arquivado), `file_mkdir`, `file_rename` (`de -> para`, tambem para mover), `file_copy` (`de -> para`) e `file_delete` (com `(recursive)` para pastas), todos com o caminho e, quando ha, os bytes. `file_failed` registra o que foi recusado, interrompido ou passou do limite. Listar pastas nao e registrado. Operador fora dos grupos da maquina recebe 404 e fica em `file_denied`.
+- Exige agent atualizado: agents antigos nao anunciam a funcao e o botao fica desabilitado com a explicacao. Agents que ja enviam e baixam arquivos mas ainda nao excluem, renomeiam, copiam nem fazem `.zip` continuam funcionando para o basico, e as acoes novas ficam desabilitadas com o motivo. Desative por servidor com `--files=false` (`FILE_TRANSFER=false` na stack) ou por maquina com `--no-files` no agent.
 
 ### Terminal como outro usuario (agent como root)
 
@@ -321,7 +327,12 @@ Custo de seguranca: antes, comprometer o agent dava um shell de usuario comum (o
 
 ### Preferencias
 
-O botao **Preferencias** na barra superior (todos os usuarios) abre a configuracao do painel. Hoje tem a secao **Transferencia de arquivos**: fechar sozinho o painel de envios ao terminar sem erros (ligado por padrao) e depois de quantos segundos (3, 5, 10 ou 30). As preferencias ficam guardadas **neste navegador** (`localStorage`, chave `rt.prefs`), nao na conta: outro navegador ou computador comeca com os padroes. A fonte e o renderizador do terminal continuam no botao **Fonte** do terminal.
+O botao **Preferencias** na barra superior (todos os usuarios) abre a configuracao do painel. As preferencias ficam **na sua conta** (no banco do servidor): valem em qualquer navegador ou computador em que voce entrar. Uma copia fica no navegador (`localStorage`, chave `rt.prefs`) como reserva, e quem ja tinha preferencias salvas so no navegador as ve migradas para a conta no primeiro acesso. Hoje:
+
+- **Painel de envios**: fechar sozinho ao terminar sem erros (ligado por padrao) e depois de quantos segundos (3, 5, 10 ou 30).
+- **Envio de arquivos e pastas**: quantos arquivos ao mesmo tempo (1 a 6, padrao 3); mostrar o resumo antes de enviar uma pasta; o que ignorar por padrao (`.git`, `node_modules`, `.DS_Store`/`Thumbs.db`/`desktop.ini`); manter o bit de executavel de scripts e binarios.
+
+A fonte e o renderizador do terminal continuam no botao **Fonte** do terminal. API: `GET /api/prefs` e `PUT /api/prefs` (so as chaves e valores conhecidos sao guardados; o resto e descartado).
 
 ### Download do agent
 

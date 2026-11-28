@@ -89,12 +89,18 @@ func fileReply(ws *websocket.Conn, m protocol.FileMessage) error {
 }
 
 func fileError(ws *websocket.Conn, err error) error {
-	return fileReply(ws, protocol.FileMessage{Op: protocol.OpError, Error: friendlyFileError(err)})
+	m := protocol.FileMessage{Op: protocol.OpError, Error: friendlyFileError(err)}
+	if errors.Is(err, os.ErrExist) && !errors.Is(err, syscall.ENOTEMPTY) { // ENOTEMPTY also matches os.ErrExist
+		m.Code = protocol.CodeExists
+	}
+	return fileReply(ws, m)
 }
 
 // friendlyFileError turns an *os.PathError into a short sentence in Portuguese.
 func friendlyFileError(err error) string {
 	switch {
+	case errors.Is(err, syscall.ENOTEMPTY):
+		return "a pasta não está vazia"
 	case errors.Is(err, os.ErrNotExist):
 		return "não existe"
 	case errors.Is(err, os.ErrPermission):
@@ -103,6 +109,8 @@ func friendlyFileError(err error) string {
 		return "já existe"
 	case errors.Is(err, syscall.ENOTDIR):
 		return "um item do caminho não é uma pasta"
+	case errors.Is(err, syscall.EXDEV):
+		return "mover entre discos diferentes não é suportado"
 	case errors.Is(err, syscall.ENOSPC):
 		return "sem espaço em disco"
 	}
@@ -155,6 +163,14 @@ func serveFiles(ws *websocket.Conn, home string) error {
 			err = servePut(ws, m)
 		case protocol.OpMkdir:
 			err = serveMkdir(ws, m)
+		case protocol.OpRm:
+			err = serveRm(ws, m, home)
+		case protocol.OpMv:
+			err = serveMv(ws, m, home)
+		case protocol.OpZip:
+			err = serveZip(ws, m)
+		case protocol.OpCp:
+			err = serveCp(ws, m)
 		default:
 			err = fileError(ws, fmt.Errorf("operação desconhecida: %q", m.Op))
 		}
@@ -359,6 +375,9 @@ func servePut(ws *websocket.Conn, m protocol.FileMessage) error {
 		}
 		break
 	}
+	if m.Mode != 0 {
+		mode = os.FileMode(m.Mode&0o777) | 0o600 // permission bits only, and never a file its owner cannot use
+	}
 	if err := tmp.Chmod(mode); err != nil {
 		return fileError(ws, err)
 	}
@@ -369,6 +388,10 @@ func servePut(ws *websocket.Conn, m protocol.FileMessage) error {
 	if err := tmp.Close(); err != nil {
 		_ = fileError(ws, err)
 		return err
+	}
+	if m.Mtime > 0 {
+		when := time.Unix(m.Mtime, 0)
+		_ = os.Chtimes(tmp.Name(), when, when) // best effort: the file is already complete
 	}
 	if err := os.Rename(tmp.Name(), path); err != nil {
 		_ = fileError(ws, err)

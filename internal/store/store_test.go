@@ -546,3 +546,26 @@ func TestOpenMigratesMachinesWithoutShellUser(t *testing.T) {
 		t.Fatal(err)
 	}
 }
+
+func TestUserPrefs(t *testing.T) {
+	s := newTestStore(t)
+	admin, err := s.CreateAdmin("ana", "some-password", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := s.UserPrefs(admin.ID); err != nil || got != "" {
+		t.Fatalf("no prefs = %q %v", got, err)
+	}
+	if err := s.SetUserPrefs(admin.ID, `{"a":1}`); err != nil {
+		t.Fatal(err)
+	}
+	if err := s.SetUserPrefs(admin.ID, `{"a":2}`); err != nil { // replaces, does not duplicate
+		t.Fatal(err)
+	}
+	if got, _ := s.UserPrefs(admin.ID); got != `{"a":2}` {
+		t.Fatalf("prefs = %q", got)
+	}
+	if err := s.SetUserPrefs(9999, `{}`); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown account = %v", err)
+	}
+}

@@ -322,7 +322,7 @@ func TestFilesMkdirAndMisuse(t *testing.T) {
 	c.wantError("binários")
 	_ = c.ws.WriteMessage(websocket.TextMessage, []byte("not json"))
 	c.wantError("inválida")
-	c.send(protocol.FileMessage{Op: "rm", Path: dir})
+	c.send(protocol.FileMessage{Op: "chmod", Path: dir})
 	c.wantError("desconhecida")
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatal("an unknown operation must do nothing")
@@ -418,4 +418,25 @@ func TestFilesMkdirParents(t *testing.T) {
 	c.wantError("não é uma pasta")
 	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: filepath.Join(file, "sub"), Parents: true})
 	c.wantError("não é uma pasta")
+}
+
+// Errors about something that already exists carry a code, so callers do not
+// have to match the wording.
+func TestFilesExistingTargetsCarryACode(t *testing.T) {
+	dir := t.TempDir()
+	_ = os.WriteFile(filepath.Join(dir, "f.txt"), nil, 0o644)
+	c := newFileClient(t)
+
+	c.send(protocol.FileMessage{Op: protocol.OpMkdir, Path: dir})
+	if m := c.reply(); m.Op != protocol.OpError || m.Code != protocol.CodeExists {
+		t.Fatalf("mkdir on an existing folder = %+v, want code %q", m, protocol.CodeExists)
+	}
+	c.send(protocol.FileMessage{Op: protocol.OpPut, Path: filepath.Join(dir, "f.txt"), Size: 1})
+	if m := c.reply(); m.Op != protocol.OpError || m.Code != protocol.CodeExists {
+		t.Fatalf("put on an existing file = %+v, want code %q", m, protocol.CodeExists)
+	}
+	c.send(protocol.FileMessage{Op: protocol.OpList, Path: filepath.Join(dir, "missing")})
+	if m := c.reply(); m.Code != "" {
+		t.Fatalf("an unrelated error must have no code: %+v", m)
+	}
 }

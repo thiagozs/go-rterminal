@@ -65,10 +65,59 @@ async function api(method, path, body) {
   return data;
 }
 
+// motion wraps anime.js. Everything degrades to "no animation" when the library
+// is missing or the user asked the system for reduced motion, so callers never
+// need to check. Only opacity and transform are animated, and always briefly.
+const motion = (() => {
+  const reduced = window.matchMedia("(prefers-reduced-motion: reduce)");
+  const ok = () => !!(window.anime && window.anime.animate) && !reduced.matches;
+  const list = (t) => (t instanceof Element ? [t] : [...t]);
+  return {
+    // appear fades targets in while they move from an offset (x, y, scale) to rest.
+    appear(targets, { x = 0, y = 8, scale = 1, duration = 180, stagger = 0 } = {}) {
+      const els = list(targets);
+      if (!ok() || !els.length) return;
+      const p = {
+        opacity: [0, 1], duration, ease: "outCubic",
+        onComplete: () => els.forEach((el) => { el.style.opacity = ""; el.style.transform = ""; }),
+      };
+      if (x) p.translateX = [x, 0];
+      if (y) p.translateY = [y, 0];
+      if (scale !== 1) p.scale = [scale, 1];
+      if (stagger) p.delay = window.anime.stagger(stagger);
+      window.anime.animate(els, p);
+    },
+    // leave fades el out and resolves when it can be removed.
+    leave(targets, { x = 0, y = 6, duration = 130 } = {}) {
+      const els = list(targets);
+      if (!ok() || !els.length) return Promise.resolve();
+      const p = { opacity: [1, 0], duration, ease: "inQuad" };
+      if (x) p.translateX = [0, x];
+      if (y) p.translateY = [0, y];
+      return new Promise((resolve) => window.anime.animate(els, { ...p, onComplete: resolve }));
+    },
+    // pulse makes el swell and settle: a state just changed.
+    pulse(el, { scale = 1.7, duration = 650 } = {}) {
+      if (!ok() || !el) return;
+      window.anime.animate(el, { scale: [1, scale, 1], duration, ease: "outElastic(1, .6)", onComplete: () => { el.style.transform = ""; } });
+    },
+    // flash highlights table rows for a moment (new arrivals).
+    flash(rows) {
+      const cells = list(rows).flatMap((r) => [...r.children]);
+      if (!ok() || !cells.length) return;
+      window.anime.animate(cells, {
+        backgroundColor: ["rgba(65, 166, 246, .5)", "rgba(65, 166, 246, 0)"], duration: 1400, ease: "outQuad",
+        onComplete: () => cells.forEach((c) => { c.style.backgroundColor = ""; }),
+      });
+    },
+  };
+})();
+
 function toast(message, kind) {
   const el = h("div", { class: "toast " + (kind || "") }, message);
   document.getElementById("toasts").append(el);
-  setTimeout(() => el.remove(), 4500);
+  motion.appear(el, { x: 28, y: 0, duration: 220 });
+  setTimeout(() => motion.leave(el, { y: 0 }).then(() => el.remove()), 4500);
 }
 
 const fail = (e) => toast(e.message || String(e), "err");
@@ -119,7 +168,7 @@ const sessionReady = () => !state.mustChange && !state.mustSetup2FA;
 
 // enterPanel loads the data and shows the panel once nothing is pending.
 async function enterPanel() {
-  if (sessionReady()) { await refresh(); startPolling(); }
+  if (sessionReady()) { await refresh(); await loadPrefs(); startPolling(); }
   render();
 }
 
@@ -133,12 +182,49 @@ function startPolling() {
 function stopPolling() { clearInterval(state.timer); state.timer = null; }
 
 // ---------- views ----------
+let lastScene = "";           // what render() showed last, so only a change of screen is animated
+const lastOnline = new Map(); // machine id -> was online, to notice a status change between refreshes
 function render() {
   const app = document.getElementById("app");
   if (!state.user) app.replaceChildren(state.pending2FA ? twoFactorLoginView() : loginView());
   else if (state.mustChange) app.replaceChildren(forcedPasswordView());
   else if (state.mustSetup2FA) app.replaceChildren(forcedSetupView());
   else { app.replaceChildren(shell()); openPopupIfRequested(); }
+  const scene = !state.user ? (state.pending2FA ? "2fa" : "login") : state.mustChange ? "password" : state.mustSetup2FA ? "setup" : "shell:" + state.view;
+  const fromShell = lastScene.startsWith("shell:");
+  const entering = scene !== lastScene;
+  lastScene = scene;
+  if (entering) animateScene(app, scene, fromShell);
+  if (scene === "shell:machines") announceStatusChanges(app, entering);
+}
+
+// animateScene plays the entrance of a screen: the card of a login-like page,
+// or the content and first rows of a panel view. Refreshes of the same screen
+// (the machine list reloads every few seconds) stay still.
+function animateScene(app, scene, fromShell) {
+  if (!scene.startsWith("shell:")) {
+    const card = app.querySelector(".login > form");
+    if (!card) return;
+    motion.appear(card, { y: 20, scale: 0.98, duration: 340 });
+    motion.appear([...card.children], { y: 8, duration: 220, stagger: 45 });
+    return;
+  }
+  if (!fromShell) motion.appear(app.querySelector(".topbar"), { y: -14, duration: 260 });
+  motion.appear(app.querySelector(".content"), { y: 10, duration: 240 });
+  motion.appear([...app.querySelectorAll(".content tbody tr")].slice(0, 20), { y: 6, duration: 200, stagger: 24 });
+}
+
+// announceStatusChanges pulses the dot (and flashes the row) of a machine that went online or offline.
+function announceStatusChanges(app, entering) {
+  for (const dot of app.querySelectorAll(".dot[data-mid]")) {
+    const id = dot.dataset.mid, now = dot.classList.contains("on");
+    if (!entering && lastOnline.has(id) && lastOnline.get(id) !== now) {
+      motion.pulse(dot);
+      const row = dot.closest("tr");
+      if (row) motion.flash(row);
+    }
+    lastOnline.set(id, now);
+  }
 }
 
 function loginView() {
@@ -245,6 +331,7 @@ function passwordModal() {
 async function logout() {
   try { await api("POST", "/api/logout"); } catch (_) { /* already gone */ }
   stopPolling();
+  accountPrefs = null; // the next account must not see these preferences
   state.user = null;
   state.mustChange = false;
   state.mustSetup2FA = false;
@@ -342,7 +429,7 @@ function updateModal(m) {
     "  armv7l|armv6l) ARCH=arm ;;",
     '  *) echo "arquitetura nao suportada: $(uname -m)" >&2; exit 1 ;;',
     "esac",
-    `printf 'Authorization: Bearer %s\\n' "$TOKEN" | curl -fsSL -H @- "${base}/download/agent/linux-$ARCH" -o /tmp/rterminal-agent`,
+    `rm -f /tmp/rterminal-agent; printf 'Authorization: Bearer %s\\n' "$TOKEN" | curl -fsSL --retry 8 --retry-all-errors --retry-delay 2 --connect-timeout 15 --speed-limit 1000 --speed-time 20 -C - -H @- "${base}/download/agent/linux-$ARCH" -o /tmp/rterminal-agent`,
     'sudo install -m 755 /tmp/rterminal-agent "$BIN.new" && sudo mv -f "$BIN.new" "$BIN" && rm -f /tmp/rterminal-agent',
     "sudo systemctl restart rterminal-agent",
     "unset TOKEN ARCH BIN",
@@ -400,6 +487,9 @@ function openMenu(anchor, items) {
   menu.style.left = `${Math.max(8, Math.min(rect.right - width, window.innerWidth - width - 8))}px`;
   menu.style.top = `${rect.bottom + 4 + height > window.innerHeight ? Math.max(8, rect.top - height - 4) : rect.bottom + 4}px`;
   anchor.setAttribute("aria-expanded", "true");
+  menu.style.transformOrigin = "top right";
+  motion.appear(menu, { y: -6, scale: 0.97, duration: 120 });
+  motion.appear(menu.querySelectorAll(".menu-item"), { x: -6, y: 0, duration: 150, stagger: 16 });
   const onDown = (e) => { if (!menu.contains(e.target) && e.target !== anchor) close(); };
   const onKey = (e) => { if (e.key === "Escape") { close(); anchor.focus(); } };
   function close() {
@@ -425,7 +515,7 @@ function machinesTable(list) {
   const rows = list.map((m) => {
     const outdated = isOutdated(m);
     return h("tr", null,
-      h("td", { class: "col-name" }, h("span", { class: "dot" + (m.online ? " on" : ""), title: m.online ? "online" : "offline" }),
+      h("td", { class: "col-name" }, h("span", { class: "dot" + (m.online ? " on" : ""), "data-mid": m.id, title: m.online ? "online" : "offline" }),
         h("strong", null, m.name), h("div", { class: "mono muted" }, m.id),
         !m.online && h("div", { class: "muted small-note" }, "visto " + timeAgo(m.last_seen))),
       h("td", { class: "col-group" }, m.group_id != null ? h("span", { class: "tag" }, groupName(m.group_id)) : h("span", { class: "muted" }, "—")),
@@ -458,10 +548,17 @@ function machinesTable(list) {
 function modal(...content) {
   const overlay = h("div", { class: "overlay", onmousedown: (e) => { if (e.target === overlay) close(); } },
     h("div", { class: "modal", role: "dialog", "aria-modal": "true" }, ...content));
-  const close = () => { overlay.remove(); document.removeEventListener("keydown", onKey); };
+  let closing = false;
+  const close = () => {
+    if (closing) return;
+    closing = true;
+    document.removeEventListener("keydown", onKey);
+    motion.leave(overlay, { y: 0, duration: 110 }).then(() => overlay.remove());
+  };
   const onKey = (e) => { if (e.key === "Escape") close(); };
   document.addEventListener("keydown", onKey);
   document.body.append(overlay);
+  motion.appear(overlay.firstElementChild, { y: 14, scale: 0.98, duration: 200 });
   const first = overlay.querySelector("input, select, button");
   if (first) first.focus();
   return close;
@@ -1524,50 +1621,94 @@ async function watchSession(info) {
   }
 }
 
-// --- preferences (kept in this browser) ---
+// --- preferences (saved on the account, mirrored in this browser) ---
 const PREFS_KEY = "rt.prefs";
 const PREF_DEFAULTS = {
   autoCloseTransfers: true, // hide the transfer panel by itself once everything succeeded
   autoCloseSeconds: 5,      // ...after this many seconds
+  uploadParallel: 3,        // files sent at the same time
+  confirmFolders: true,     // show a summary before sending a folder
+  skipGit: true,            // when sending folders: leave out .git
+  skipNodeModules: true,    //                       leave out node_modules
+  skipJunk: true,           //                       leave out .DS_Store, Thumbs.db, desktop.ini
+  keepExecutable: true,     // keep the executable bit of scripts (#!) and binaries (ELF)
 };
+const PREF_RANGES = { autoCloseSeconds: [1, 60], uploadParallel: [1, 6] };
 const CLOSE_CHOICES = [3, 5, 10, 30];
+let accountPrefs = null; // what the server holds for this account (null until loaded)
 
-function prefs() {
-  let saved = {};
-  try { saved = JSON.parse(stored(PREFS_KEY) || "{}") || {}; } catch (_) { /* damaged: use the defaults */ }
-  const out = { ...PREF_DEFAULTS };
-  if (typeof saved.autoCloseTransfers === "boolean") out.autoCloseTransfers = saved.autoCloseTransfers;
-  const secs = Number(saved.autoCloseSeconds);
-  if (Number.isFinite(secs) && secs >= 1 && secs <= 60) out.autoCloseSeconds = Math.round(secs);
+// cleanPrefs keeps only known preferences of the right type and range.
+function cleanPrefs(raw) {
+  const out = {};
+  if (!raw || typeof raw !== "object") return out;
+  for (const [key, def] of Object.entries(PREF_DEFAULTS)) {
+    const v = raw[key];
+    if (typeof def === "boolean") { if (typeof v === "boolean") out[key] = v; }
+    else if (Number.isInteger(v) && v >= PREF_RANGES[key][0] && v <= PREF_RANGES[key][1]) out[key] = v;
+  }
   return out;
 }
-function savePrefs(patch) { store(PREFS_KEY, JSON.stringify({ ...prefs(), ...patch })); }
+function localPrefs() { try { return cleanPrefs(JSON.parse(stored(PREFS_KEY) || "{}")); } catch (_) { return {}; } }
+function prefs() { return { ...PREF_DEFAULTS, ...localPrefs(), ...(accountPrefs || {}) }; }
+// loadPrefs reads the account's preferences. Ones saved only in this browser
+// before the account had any are sent up, so nothing is lost.
+async function loadPrefs() {
+  try {
+    accountPrefs = cleanPrefs(await api("GET", "/api/prefs"));
+    const local = localPrefs();
+    if (!Object.keys(accountPrefs).length && Object.keys(local).length) accountPrefs = cleanPrefs(await api("PUT", "/api/prefs", local));
+  } catch (_) { accountPrefs = null; /* offline or an older server: this browser's copy is used */ }
+}
+function savePrefs(patch) {
+  const clean = cleanPrefs(patch);
+  accountPrefs = cleanPrefs({ ...prefs(), ...clean });
+  store(PREFS_KEY, JSON.stringify(accountPrefs));
+  api("PUT", "/api/prefs", clean).catch(() => { /* kept locally; sent again with the next change */ });
+}
 
 function preferencesModal() {
   const p = prefs();
-  const auto = h("input", { type: "checkbox", id: "pf-auto", checked: p.autoCloseTransfers });
+  const check = (id, label, on) => h("label", { class: "check", for: id }, h("input", { type: "checkbox", id, checked: on }), label);
+  const auto = check("pf-auto", "Fechar sozinho o painel de envios quando terminar sem erros", p.autoCloseTransfers);
   const choices = CLOSE_CHOICES.includes(p.autoCloseSeconds) ? CLOSE_CHOICES : [...CLOSE_CHOICES, p.autoCloseSeconds].sort((a, b) => a - b);
   const secs = h("select", { id: "pf-secs", disabled: !p.autoCloseTransfers },
     ...choices.map((v) => h("option", { value: String(v), selected: v === p.autoCloseSeconds }, `${v} segundos`)));
-  auto.addEventListener("change", () => { secs.disabled = !auto.checked; });
+  auto.querySelector("input").addEventListener("change", (e) => { secs.disabled = !e.target.checked; });
+  const parallel = h("select", { id: "pf-par" },
+    ...[1, 2, 3, 4, 5, 6].map((v) => h("option", { value: String(v), selected: v === p.uploadParallel }, v === 1 ? "1 (um por vez)" : `${v} ao mesmo tempo`)));
+  const confirm_ = check("pf-confirm", "Mostrar um resumo antes de enviar uma pasta", p.confirmFolders);
+  const git = check("pf-git", ".git (histórico do Git)", p.skipGit);
+  const nm = check("pf-nm", "node_modules", p.skipNodeModules);
+  const junk = check("pf-junk", ".DS_Store, Thumbs.db e desktop.ini", p.skipJunk);
+  const exec = check("pf-exec", "Manter o bit de executável de scripts (#!) e binários (ELF)", p.keepExecutable);
+  const on = (box) => box.querySelector("input").checked;
   const close = modal(
     h("h2", null, "Preferências"),
-    h("p", { class: "muted" }, "Valem para este navegador e ficam guardadas nele."),
+    h("p", { class: "muted" }, "Ficam guardadas na sua conta e valem em qualquer navegador em que você entrar."),
     h("section", { class: "security" },
-      h("h3", null, "Transferência de arquivos"),
-      h("label", { class: "check", for: "pf-auto" }, auto, "Fechar sozinho o painel de envios quando terminar sem erros"),
-      h("label", { for: "pf-secs" }, "Fechar depois de"), secs,
-      h("p", { class: "muted small-note" }, "Com a opção desligada o painel fica aberto até você fechá-lo. Se algum arquivo falhar, ele nunca fecha sozinho.")),
+      h("h3", null, "Painel de envios"),
+      auto, h("label", { for: "pf-secs" }, "Fechar depois de"), secs,
+      h("p", { class: "muted small-note" }, "Com a opção desligada o painel fica aberto até você fechá-lo. Se algum item falhar, ele nunca fecha sozinho.")),
+    h("section", { class: "security" },
+      h("h3", null, "Envio de arquivos e pastas"),
+      h("label", { for: "pf-par" }, "Arquivos enviados ao mesmo tempo"), parallel,
+      confirm_,
+      h("p", { class: "muted small-note", style: "margin-bottom:2px" }, "Ao enviar uma pasta, ignorar por padrão:"),
+      git, nm, junk, exec),
     h("div", { class: "modal-actions" },
       h("button", { class: "btn", type: "button", onclick: () => close() }, "Cancelar"),
       h("button", { class: "btn primary", type: "button", onclick: () => {
-        savePrefs({ autoCloseTransfers: auto.checked, autoCloseSeconds: Number(secs.value) });
+        savePrefs({
+          autoCloseTransfers: on(auto), autoCloseSeconds: Number(secs.value), uploadParallel: Number(parallel.value),
+          confirmFolders: on(confirm_), skipGit: on(git), skipNodeModules: on(nm), skipJunk: on(junk), keepExecutable: on(exec),
+        });
         close(); toast("Preferências salvas", "ok");
       } }, "Salvar")));
 }
 
 // --- file transfer ---
 const FILE_CHUNK = 64 * 1024;
+const STREAM_MIN = 64 * 1024 * 1024; // downloads from this size on are written straight to disk when the browser can
 const joinPath = (dir, name) => (dir === "/" ? "" : dir.replace(/\/+$/, "")) + "/" + name;
 const parentPath = (p) => p.replace(/\/+$/, "").replace(/\/[^/]*$/, "") || "/";
 
@@ -1620,87 +1761,224 @@ function collectPicked(fileList) {
   }
   return out;
 }
-// emptyFolders lists the folders that need their own request: the ones that
-// are not an ancestor of another folder or of a file (those get created on the way).
-function emptyFolders(collected) {
-  const ancestors = new Set();
-  const mark = (rel) => {
+// allFolders lists every folder a batch needs, parents before children: the
+// ones the user sent plus every folder on the way to a file. They are created
+// up front by the panel itself, so sending a folder never depends on the
+// destination existing or on how new the agent is.
+function allFolders(collected) {
+  const folders = new Set();
+  const add = (rel) => {
     const parts = rel.split("/");
-    for (let i = 1; i < parts.length; i++) ancestors.add(parts.slice(0, i).join("/"));
+    for (let i = 1; i <= parts.length; i++) folders.add(parts.slice(0, i).join("/"));
   };
-  collected.files.forEach((f) => mark(f.rel));
-  collected.dirs.forEach(mark);
-  return [...new Set(collected.dirs.map(cleanRel).filter(Boolean))].filter((d) => !ancestors.has(d));
+  collected.dirs.map(cleanRel).filter(Boolean).forEach(add);
+  collected.files.forEach((f) => { const dir = f.rel.split("/").slice(0, -1).join("/"); if (dir) add(dir); });
+  return [...folders].sort((a, b) => a.split("/").length - b.split("/").length || a.localeCompare(b));
 }
 
-// chooseConflict asks what to do with a file that already exists.
-function chooseConflict(path) {
+// --- what a folder contains: categories to leave out, hidden files ---
+const JUNK_NAMES = new Set([".DS_Store", "Thumbs.db", "desktop.ini"]);
+function categoryOf(rel) {
+  const parts = rel.split("/");
+  if (parts.includes(".git")) return "git";
+  if (parts.includes("node_modules")) return "nodeModules";
+  if (JUNK_NAMES.has(parts[parts.length - 1])) return "junk";
+  return null;
+}
+const isHidden = (rel) => rel.split("/").some((p) => p.startsWith("."));
+function summarize(collected) {
+  const s = { files: 0, bytes: 0, git: [0, 0], nodeModules: [0, 0], junk: [0, 0], hidden: [0, 0] };
+  for (const { file, rel } of collected.files) {
+    s.files++; s.bytes += file.size;
+    const c = categoryOf(rel) || (isHidden(rel) ? "hidden" : null);
+    if (c) { s[c][0]++; s[c][1] += file.size; }
+  }
+  return s;
+}
+function filterCollected(collected, skip) {
+  const drop = (rel) => { const c = categoryOf(rel); return !!((c && skip[c]) || (skip.hidden && isHidden(rel))); };
+  return { files: collected.files.filter((f) => !drop(f.rel)), dirs: collected.dirs.filter((d) => !drop(d)) };
+}
+
+// dialog shows a modal and resolves with the value of the button pressed
+// (Escape resolves with escapeValue). nodes is the content between the title
+// and the buttons.
+function dialog(title, nodes, buttons, escapeValue) {
   return new Promise((resolve) => {
-    const finish = (value) => { overlay.remove(); document.removeEventListener("keydown", onKey, true); resolve(value); };
-    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); finish("skip"); } };
-    const btn = (label, value, cls) => h("button", { class: "btn" + (cls ? " " + cls : ""), type: "button", onclick: () => finish(value) }, label);
+    const finish = (value) => {
+      document.removeEventListener("keydown", onKey, true);
+      motion.leave(overlay, { y: 0, duration: 110 }).then(() => overlay.remove());
+      resolve(value);
+    };
+    const onKey = (e) => { if (e.key === "Escape") { e.stopPropagation(); finish(escapeValue); } };
     const overlay = h("div", { class: "overlay" },
-      h("div", { class: "modal", role: "dialog", "aria-modal": "true", style: "width:min(540px,100%)" },
-        h("h2", null, "O arquivo já existe"),
-        h("p", { class: "muted mono", style: "word-break:break-all" }, path),
-        h("p", null, "Substituir o arquivo que está na máquina pelo que você está enviando?"),
+      h("div", { class: "modal", role: "dialog", "aria-modal": "true", style: "width:min(560px,100%)" },
+        h("h2", null, title), ...nodes,
         h("div", { class: "modal-actions", style: "flex-wrap:wrap" },
-          btn("Pular", "skip"), btn("Pular todos", "skipAll"), btn("Substituir", "replace"), btn("Substituir todos", "replaceAll", "primary"))));
+          buttons.map((b) => h("button", { class: "btn" + (b.cls ? " " + b.cls : ""), type: "button", onclick: () => finish(b.value) }, b.label)))));
     document.addEventListener("keydown", onKey, true);
     document.body.append(overlay);
-    overlay.querySelector("button").focus();
+    motion.appear(overlay.firstElementChild, { y: 14, scale: 0.98, duration: 200 });
+    const primary = overlay.querySelector(".modal-actions .primary, .modal-actions .danger") || overlay.querySelector(".modal-actions button");
+    if (primary) primary.focus();
   });
 }
+const chooseConflict = (path) => dialog("O arquivo já existe",
+  [h("p", { class: "muted mono", style: "word-break:break-all" }, path), h("p", null, "Substituir o arquivo que está na máquina pelo que você está enviando?")],
+  [{ label: "Pular", value: "skip" }, { label: "Pular todos", value: "skipAll" }, { label: "Substituir", value: "replace" }, { label: "Substituir todos", value: "replaceAll", cls: "primary" }], "skip");
 
-// openFiles shows a file manager for one machine. Browsing, downloads and
-// uploads travel over a WebSocket channel to the agent, one operation at a time.
-function openFiles(machine) {
-  let ws = null, cwd = "", closed = false;
-  const inbox = [];
-  let waiter = null, dead = null;
-  const push = (f) => { if (waiter) { const w = waiter; waiter = null; w(f); } else inbox.push(f); };
-  const next = () => inbox.length ? Promise.resolve(inbox.shift()) : dead ? Promise.resolve(dead) : new Promise((r) => { waiter = r; });
+// confirmFolderUpload shows what a folder holds before it is sent and lets the
+// user leave out .git, node_modules, junk files and hidden files. It resolves
+// with what should be sent, or null if the user gave up.
+async function confirmFolderUpload(collected, dest) {
+  const hasFolder = collected.dirs.length > 0 || collected.files.some((f) => f.rel.includes("/"));
+  if (!hasFolder) return collected;
+  const p = prefs();
+  const defaults = { git: p.skipGit, nodeModules: p.skipNodeModules, junk: p.skipJunk, hidden: false };
+  if (!p.confirmFolders) {
+    const kept = filterCollected(collected, defaults);
+    const dropped = collected.files.length - kept.files.length;
+    if (dropped) toast(`${dropped} arquivo${dropped > 1 ? "s" : ""} ignorado${dropped > 1 ? "s" : ""}, conforme as suas preferências.`);
+    return kept;
+  }
+  const sum = summarize(collected);
+  const boxes = {};
+  const rows = [];
+  const labels = { git: ".git (histórico do Git)", nodeModules: "node_modules", junk: ".DS_Store, Thumbs.db e desktop.ini", hidden: "outros arquivos e pastas ocultos (começam com ponto, como .env)" };
+  for (const key of ["git", "nodeModules", "junk", "hidden"]) {
+    if (!sum[key][0]) continue;
+    boxes[key] = h("input", { type: "checkbox", id: "fu-" + key, checked: defaults[key] });
+    rows.push(h("label", { class: "check", for: "fu-" + key }, boxes[key], `Ignorar ${labels[key]} `, h("span", { class: "muted" }, `· ${sum[key][0]} arquivo${sum[key][0] > 1 ? "s" : ""}, ${formatSize(sum[key][1])}`)));
+  }
+  const total = h("p", { style: "margin:10px 0 0" });
+  const skipNow = () => Object.fromEntries(["git", "nodeModules", "junk", "hidden"].map((k) => [k, !!(boxes[k] && boxes[k].checked)]));
+  const refresh_ = () => {
+    const s = summarize(filterCollected(collected, skipNow()));
+    total.replaceChildren(h("strong", null, `${s.files} arquivo${s.files === 1 ? "" : "s"}`), ` · ${formatSize(s.bytes)} serão enviados`);
+  };
+  Object.values(boxes).forEach((b) => b.addEventListener("change", refresh_));
+  refresh_();
+  const answer = await dialog("Enviar pasta",
+    [h("p", { class: "muted mono", style: "word-break:break-all" }, "para " + dest),
+      h("p", null, `A seleção tem ${sum.files} arquivo${sum.files === 1 ? "" : "s"} (${formatSize(sum.bytes)}).`),
+      rows.length ? h("div", { class: "checks", style: "max-height:none" }, ...rows) : h("p", { class: "muted small-note" }, "Nada que costume ficar de fora (.git, node_modules…) foi encontrado."),
+      total,
+      h("p", { class: "muted small-note" }, "A estrutura de pastas é mantida. Os padrões acima ficam em Preferências.")],
+    [{ label: "Cancelar", value: false }, { label: "Enviar", value: true, cls: "primary" }], false);
+  if (!answer) return null;
+  const kept = filterCollected(collected, skipNow());
+  return kept.files.length || kept.dirs.length ? kept : (toast("Nada para enviar.", "err"), null);
+}
 
+// looksExecutable tells scripts (#!) and ELF binaries by their first bytes: the
+// browser does not say which files are executable.
+async function looksExecutable(file) {
+  if (file.size < 2) return false;
+  const head = new Uint8Array(await file.slice(0, 4).arrayBuffer());
+  return (head[0] === 0x23 && head[1] === 0x21) || (head.length === 4 && head[0] === 0x7f && head[1] === 0x45 && head[2] === 0x4c && head[3] === 0x46);
+}
+
+// saveBlob hands a finished download to the browser.
+function saveBlob(blob, name) {
+  const url = URL.createObjectURL(blob);
+  const a = h("a", { href: url, download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(() => URL.revokeObjectURL(url), 60000);
+}
+// pickSaveHandle asks where to save, for downloads written straight to disk.
+// It has to run inside the click that started the download (the browser wants a
+// user gesture), so callers invoke it before anything asynchronous. It resolves
+// with a handle, with undefined when the browser cannot stream or the user
+// did not ask for it, or with null when the user closed the dialog.
+function pickSaveHandle(name, wanted) {
+  if (!wanted || typeof window.showSaveFilePicker !== "function") return Promise.resolve(undefined);
+  try {
+    return window.showSaveFilePicker({ suggestedName: name }).catch((e) => (e && e.name === "AbortError" ? null : undefined));
+  } catch (_) { return Promise.resolve(undefined); }
+}
+async function openSink(handle, name) {
+  if (handle) {
+    const w = await handle.createWritable();
+    return { write: (c) => w.write(c), done: () => w.close(), abort: async () => { try { await w.abort(); } catch (_) { /* already gone */ } } };
+  }
+  const parts = [];
+  return { write: async (c) => { parts.push(c); }, done: async () => saveBlob(new Blob(parts), name), abort: async () => {} };
+}
+
+// Channel is one WebSocket to the agent's file service. Operations on a
+// channel never overlap; parallel uploads use several channels.
+class Channel {
+  constructor(machineId) { this.machineId = machineId; this.ws = null; this.inbox = []; this.waiter = null; this.dead = null; this.closed = false; }
+  push(f) { if (this.waiter) { const w = this.waiter; this.waiter = null; w(f); } else this.inbox.push(f); }
+  next() { return this.inbox.length ? Promise.resolve(this.inbox.shift()) : this.dead ? Promise.resolve(this.dead) : new Promise((r) => { this.waiter = r; }); }
+  send(m) { this.ws.send(JSON.stringify(m)); }
+  get buffered() { return this.ws ? this.ws.bufferedAmount : 0; }
   // connect opens the channel and resolves once the agent has joined.
-  function connect() {
-    if (closed) return Promise.reject(new Error("tela de arquivos fechada"));
-    if (ws && ws.readyState === WebSocket.OPEN) return Promise.resolve();
-    inbox.length = 0; dead = null;
+  connect() {
+    if (this.closed) return Promise.reject(new Error("tela de arquivos fechada"));
+    if (this.ws && this.ws.readyState === WebSocket.OPEN) return Promise.resolve();
+    this.inbox.length = 0; this.dead = null;
     const proto = location.protocol === "https:" ? "wss:" : "ws:";
-    ws = new WebSocket(`${proto}//${location.host}/ws/files?machine=${encodeURIComponent(machine.id)}`);
-    ws.binaryType = "arraybuffer";
-    const mine = ws;
+    const mine = new WebSocket(`${proto}//${location.host}/ws/files?machine=${encodeURIComponent(this.machineId)}`);
+    this.ws = mine;
+    mine.binaryType = "arraybuffer";
     return new Promise((resolve, reject) => {
       let paired = false;
       mine.onmessage = (ev) => {
-        if (typeof ev.data !== "string") { push({ binary: new Uint8Array(ev.data) }); return; }
+        if (typeof ev.data !== "string") { this.push({ binary: new Uint8Array(ev.data) }); return; }
         let msg; try { msg = JSON.parse(ev.data); } catch (_) { return; }
         if (msg.type === "paired") { paired = true; resolve(); return; }
-        push({ msg });
+        this.push({ msg });
       };
       mine.onclose = (ev) => {
-        if (ws !== mine) return; // a connection that was already replaced
-        dead = { closed: true, reason: ev.reason || "conexão encerrada" };
-        if (waiter) { const w = waiter; waiter = null; w(dead); }
+        if (this.ws !== mine) return; // a connection that was already replaced
+        this.dead = { closed: true, reason: ev.reason || "conexão encerrada" };
+        if (this.waiter) { const w = this.waiter; this.waiter = null; w(this.dead); }
         if (!paired) reject(new Error(ev.reason || "não foi possível abrir o canal de arquivos"));
       };
       mine.onerror = () => {};
     });
   }
-  const sendOp = (m) => ws.send(JSON.stringify(m));
-  const fail = (frame) => { throw new Error(frame.closed ? frame.reason : frame.msg && frame.msg.error ? frame.msg.error : "resposta inesperada"); };
+  // drop ends the current connection; the next operation opens a new one.
+  drop() { if (this.ws) this.ws.close(); }
+  close() { this.closed = true; this.drop(); }
+}
+const failWith = (frame) => { throw new Error(frame.closed ? frame.reason : frame.msg && frame.msg.error ? frame.msg.error : "resposta inesperada"); };
 
-  // Operations never overlap: each waits for the previous one.
+// openFiles shows a file manager for one machine.
+function openFiles(machine) {
+  let cwd = "", closed = false, entries = [];
+  let shownDir = null, shownNames = null;     // the folder last listed, to tell what is new after a refresh
+  const main = new Channel(machine.id);      // browsing and the operations that run one at a time
+  const workers = new Set();                  // channels of the parallel uploads
+  const selected = new Set();                 // names selected in the open folder
+  const manage = !!machine.can_files_manage;  // delete, rename and zip need a newer agent
+  const noManage = "Este agent é antigo e não exclui, renomeia nem baixa pastas: atualize-o";
+  const copy = !!machine.can_files_copy;      // copying needs a newer agent too
+  const noCopy = "Este agent é antigo e não copia: atualize-o";
+  const DRAG = "application/x-rterminal-items";
+
+  // Operations on the main channel never overlap: each waits for the previous one.
   let chain = Promise.resolve();
   const serial = (fn) => { const run = chain.then(fn, fn); chain = run.catch(() => {}); return run; };
 
   // --- layout ---
+  const upBtn = h("button", { class: "btn small", title: "Pasta acima (solte aqui para mover para a pasta acima)", "aria-label": "Pasta acima", onclick: () => go(parentPath(cwd)) }, "↑");
   const pathInput = h("input", { class: "files-path", "aria-label": "Caminho", spellcheck: "false" });
   const body = h("tbody");
   const picker = h("input", { type: "file", multiple: true, hidden: true });
   const folderPicker = h("input", { type: "file", multiple: true, webkitdirectory: true, hidden: true });
+  const selectAll = h("input", { type: "checkbox", "aria-label": "Selecionar tudo" });
   const drop = h("div", { class: "files-drop" }, h("table", { class: "files-table" },
-    h("thead", null, h("tr", null, ["Nome", "Tamanho", "Modificado", ""].map((x) => h("th", null, x)))), body));
+    h("thead", null, h("tr", null, h("th", { class: "sel" }, selectAll), ...["Nome", "Tamanho", "Modificado", ""].map((x) => h("th", null, x)))), body));
+  const selCount = h("strong");
+  const dlBtn = h("button", { class: "btn small primary", type: "button", onclick: () => downloadSelected() }, "Baixar");
+  const renameBtn = h("button", { class: "btn small", type: "button", onclick: () => renameSelected() }, "Renomear");
+  const moveBtn = h("button", { class: "btn small", type: "button", onclick: () => askDestination(false) }, "Mover…");
+  const copyBtn = h("button", { class: "btn small", type: "button", onclick: () => askDestination(true) }, "Copiar…");
+  const delBtn = h("button", { class: "btn small danger", type: "button", onclick: () => deleteSelected() }, "Excluir");
+  const actions = h("div", { class: "files-actions", hidden: true }, selCount, dlBtn, renameBtn, moveBtn, copyBtn, delBtn,
+    h("button", { class: "linklike", type: "button", onclick: () => { selected.clear(); syncSelection(); } }, "Limpar seleção"));
   const overlay = h("div", { class: "player-overlay files-overlay" },
     h("div", { class: "term-bar" },
       h("span", { class: "brand" }, "Arquivos"), h("span", { class: "muted" }, machine.name),
@@ -1708,20 +1986,21 @@ function openFiles(machine) {
       h("button", { class: "btn small", onclick: () => close() }, "Fechar")),
     h("div", { class: "files-body" },
       h("div", { class: "files-toolbar" },
-        h("button", { class: "btn small", title: "Pasta acima", "aria-label": "Pasta acima", onclick: () => go(parentPath(cwd)) }, "↑"),
+        upBtn,
         h("button", { class: "btn small", title: "Recarregar", "aria-label": "Recarregar", onclick: () => go(cwd) }, "⟳"),
         pathInput,
         h("button", { class: "btn small", onclick: () => makeFolder() }, "Nova pasta"),
         h("button", { class: "btn small", title: "Envia uma pasta inteira, com as subpastas e os arquivos, mantendo a estrutura", onclick: () => folderPicker.click() }, "Enviar pasta"),
         h("button", { class: "btn small primary", onclick: () => picker.click() }, "Enviar arquivos"),
         picker, folderPicker),
-      h("p", { class: "muted files-hint" }, "Arraste arquivos ou pastas para cá para enviá-los à pasta aberta; as pastas chegam com todas as subpastas, como na origem. Os arquivos enviados pertencem ao usuário do terminal desta máquina. Cada envio e download fica registrado em Auditoria."),
+      actions,
+      h("p", { class: "muted files-hint" }, "Arraste arquivos ou pastas para cá para enviá-los à pasta aberta; as pastas chegam com todas as subpastas, como na origem. Selecione itens para baixar (pastas e vários viram um .zip), renomear ou excluir. Os arquivos enviados pertencem ao usuário do terminal desta máquina. Tudo fica registrado em Auditoria."),
       drop));
   document.body.append(overlay);
 
   // --- transfer panel (docked at the bottom) ---
   const jobs = [];           // everything of the current batch
-  let cancelled = false, startedAt = 0, conflictPolicy = null, closeTimer = null, collapsed = false, renderQueued = false;
+  let cancelled = false, startedAt = 0, conflictPolicy = null, conflictLock = Promise.resolve(), closeTimer = null, collapsed = false, renderQueued = false;
   const title = h("strong");
   const detail = h("span", { class: "muted xfer-detail" });
   const fill = h("div", { class: "bar-fill" });
@@ -1752,24 +2031,28 @@ function openFiles(machine) {
     return c;
   };
   const scheduleRender = () => { if (!renderQueued) { renderQueued = true; requestAnimationFrame(() => { renderQueued = false; render(); }); } };
+  const VERB = { up: "Enviando", dir: "Preparando pastas", down: "Baixando", del: "Excluindo" };
 
+  let wasActive = false;
   function render() {
     overlay.classList.toggle("has-panel", jobs.length > 0);
     if (!jobs.length) { panel.hidden = true; return; }
-    panel.hidden = false;
+    if (panel.hidden) { panel.hidden = false; motion.appear(panel, { y: 18, duration: 220 }); }
     const c = counts();
-    const uploading = jobs.some((j) => j.kind !== "down");
     const pct = c.bytes ? c.done / c.bytes : c.finished / c.total;
     if (c.active) {
       const secs = Math.max(0.5, (Date.now() - startedAt) / 1000);
-      title.textContent = `${uploading ? "Enviando" : "Baixando"} ${Math.min(c.finished + 1, c.total)} de ${c.total}`;
-      detail.textContent = ` · ${Math.round(pct * 100)}%` + (c.bytes ? ` · ${formatSize(c.done)} de ${formatSize(c.bytes)} · ${formatSize(c.done / secs)}/s` : "") + (c.queued > 0 ? ` · ${c.queued} na fila` : "");
+      const current = jobs.find((j) => j.state === "running") || jobs.find((j) => j.state === "queued");
+      title.textContent = `${VERB[current.kind]} ${Math.min(c.finished + c.running, c.total)} de ${c.total}`;
+      detail.textContent = ` · ${Math.round(pct * 100)}%` + (c.done ? ` · ${formatSize(c.done)}${c.bytes ? " de " + formatSize(c.bytes) : ""} · ${formatSize(c.done / secs)}/s` : "") + (c.queued > 0 ? ` · ${c.queued} na fila` : "");
     } else {
       title.textContent = c.err ? `Terminou com ${c.err} erro${c.err > 1 ? "s" : ""}` : cancelled ? "Cancelado" : c.total === 1 ? "Concluído" : `${c.ok + c.skipped} itens concluídos`;
       detail.textContent = " · " + [c.ok && `${c.ok} ok`, c.skipped && `${c.skipped} pulado${c.skipped > 1 ? "s" : ""}`, c.err && `${c.err} com erro`, c.cancelled && `${c.cancelled} cancelado${c.cancelled > 1 ? "s" : ""}`, c.bytes && formatSize(c.bytes)].filter(Boolean).join(" · ");
     }
     fill.style.width = `${Math.min(100, pct * 100)}%`;
     fill.className = "bar-fill" + (!c.active && c.err ? " bad" : !c.active ? " ok" : "");
+    if (wasActive && !c.active) motion.pulse(title, { scale: 1.08, duration: 500 });
+    wasActive = c.active;
     toggleBtn.textContent = collapsed ? "▴" : "▾";
     list.hidden = collapsed;
     cancelBtn.hidden = !c.active;
@@ -1778,9 +2061,11 @@ function openFiles(machine) {
     for (const j of jobs) if (j.row) updateRow(j);
   }
 
-  const ICON = { up: "↑", down: "↓", dir: "📁" };
+  const ICON = { up: "↑", down: "↓", dir: "📁", del: "🗑", mv: "➜", cp: "⧉" };
   function updateRow(j) {
-    const text = { queued: "na fila", running: j.size ? `${Math.round((j.done / j.size) * 100)}% · ${formatSize(j.done)} de ${formatSize(j.size)}` : "…", ok: j.kind === "dir" ? "pasta criada" : `${j.kind === "down" ? "baixado" : "enviado"} · ${formatSize(j.size)}`, skipped: j.note, err: j.note, cancelled: "cancelado" }[j.state];
+    const sizeText = j.size ? formatSize(j.size) : j.done ? formatSize(j.done) : "";
+    const okText = { dir: j.note || "pasta pronta", del: "excluído", mv: "movido", cp: `copiado${j.note ? " · " + j.note : ""}`, down: `baixado${sizeText ? " · " + sizeText : ""}${j.note ? " · " + j.note : ""}`, up: `enviado${sizeText ? " · " + sizeText : ""}` }[j.kind];
+    const text = { queued: "na fila", running: j.size ? `${Math.round((j.done / j.size) * 100)}% · ${formatSize(j.done)} de ${formatSize(j.size)}` : j.done ? formatSize(j.done) : "…", ok: okText, skipped: j.note, err: j.note, cancelled: "cancelado" }[j.state];
     j.row.stat.textContent = text;
     j.row.stat.className = "xfer-stat " + (j.state === "err" ? "error-text" : "muted");
     j.row.fill.style.width = j.state === "ok" || j.state === "err" ? "100%" : j.size ? `${Math.min(100, (j.done / j.size) * 100)}%` : j.state === "running" ? "30%" : "0";
@@ -1794,6 +2079,7 @@ function openFiles(machine) {
     const el = h("div", { class: "xfer" }, h("span", { class: "xfer-name", title: j.label }, `${ICON[j.kind]} ${j.label}`), h("div", { class: "bar" }, fillEl), stat);
     j.row = { el, fill: fillEl, stat };
     list.append(el);
+    motion.appear(el, { y: 6, duration: 150 });
     list.scrollTop = list.scrollHeight;
     // Keep the list light on huge folders: drop the oldest rows that succeeded.
     const done = [...list.children].filter((x) => x.dataset.state === "ok");
@@ -1835,150 +2121,366 @@ function openFiles(machine) {
     jobs.push(...added);
     render();
   }
-  function newJob(kind, label, size, run) { return { kind, label, size, done: 0, state: "queued", note: "", row: null, run }; }
+  const newJob = (kind, label, size, run) => ({ kind, label, size, done: 0, state: "queued", note: "", row: null, run });
 
-  // execute runs one job; it never throws, failures become the job's state.
-  async function execute(j) {
-    if (cancelled) { j.state = "cancelled"; ensureRow(j); updateRow(j); scheduleRender(); return; }
+  // execute runs one job on a channel; it never throws, failures become the job's state.
+  async function execute(j, ch) {
+    if (cancelled || closed) { j.state = "cancelled"; ensureRow(j); updateRow(j); scheduleRender(); return; }
     j.state = "running"; ensureRow(j); render();
     try {
-      await connect();
-      await j.run(j);
+      await ch.connect();
+      await j.run(j, ch);
       if (j.state === "running") j.state = "ok";
     } catch (e) {
       if (e && e.cancelled) j.state = "cancelled";
-      else { j.state = "err"; j.note = e.message || String(e); }
+      else { j.state = "err"; j.note = (e && e.message) || String(e); }
     }
     updateRow(j);
     render();
     if (!counts().active) maybeAutoClose();
   }
 
-  // --- listing ---
+  // --- listing and selection ---
   async function list_(path) {
-    await connect();
-    sendOp({ op: "list", path });
-    const f = await next();
-    if (!f.msg || f.msg.op !== "list") fail(f);
+    await main.connect();
+    main.send({ op: "list", path });
+    const f = await main.next();
+    if (!f.msg || f.msg.op !== "list") failWith(f);
     return f.msg;
   }
+  function syncSelection() {
+    const names = new Set(entries.map((e) => e.name));
+    for (const n of [...selected]) if (!names.has(n)) selected.delete(n);
+    if (selected.size > 0 && actions.hidden) motion.appear(actions, { y: -6, duration: 140 });
+    actions.hidden = selected.size === 0;
+    selCount.textContent = `${selected.size} selecionado${selected.size > 1 ? "s" : ""}`;
+    const items = entries.filter((e) => selected.has(e.name));
+    const needsManage = items.length > 1 || (items.length === 1 && items[0].dir);
+    dlBtn.disabled = needsManage && !manage;
+    dlBtn.title = dlBtn.disabled ? noManage : needsManage ? "Baixa tudo num arquivo .zip" : "Baixa o arquivo";
+    dlBtn.textContent = needsManage ? "Baixar .zip" : "Baixar";
+    renameBtn.disabled = selected.size !== 1 || !manage; renameBtn.title = !manage ? noManage : "";
+    delBtn.disabled = !manage; delBtn.title = !manage ? noManage : "";
+    moveBtn.disabled = !manage; moveBtn.title = !manage ? noManage : "Move para outra pasta (ou arraste sobre uma pasta)";
+    copyBtn.disabled = !copy; copyBtn.title = !copy ? noCopy : "Copia para outra pasta (ou arraste sobre uma pasta com Alt)";
+    selectAll.checked = entries.length > 0 && selected.size === entries.length;
+    selectAll.indeterminate = selected.size > 0 && selected.size < entries.length;
+    body.querySelectorAll("input[data-name]").forEach((cb) => { cb.checked = selected.has(cb.dataset.name); });
+  }
+  selectAll.addEventListener("change", () => { if (selectAll.checked) entries.forEach((e) => selected.add(e.name)); else selected.clear(); syncSelection(); });
+
   async function go(path) {
     if (closed) return;
     try {
       const r = await serial(() => list_(path));
-      cwd = r.path; pathInput.value = cwd;
-      const rows = (r.entries || []).map((e) => {
+      const previous = shownDir === r.path ? shownNames : null; // same folder again: highlight what is new
+      cwd = r.path; pathInput.value = cwd; entries = r.entries || [];
+      shownDir = cwd; shownNames = new Set(entries.map((e) => e.name));
+      selected.clear();
+      const rows = entries.map((e) => {
         const name = e.dir
           ? h("button", { class: "linklike", onclick: () => go(joinPath(cwd, e.name)) }, "📁 " + e.name)
           : h("span", null, "📄 " + e.name);
-        return h("tr", null,
+        const cb = h("input", { type: "checkbox", "aria-label": `Selecionar ${e.name}`, "data-name": e.name });
+        cb.addEventListener("change", () => { if (cb.checked) selected.add(e.name); else selected.delete(e.name); syncSelection(); });
+        const tr = h("tr", null,
+          h("td", { class: "sel" }, cb),
           h("td", null, name, e.link && h("span", { class: "muted", title: "Link simbólico" }, " →")),
           h("td", { class: "muted mono" }, e.dir ? "" : formatSize(e.size)),
           h("td", { class: "muted" }, e.mtime ? new Date(e.mtime * 1000).toLocaleString() : ""),
           h("td", null, !e.dir && h("button", { class: "btn small", onclick: () => download(joinPath(cwd, e.name), e.name, e.size) }, "Baixar")));
+        if (manage) {
+          tr.draggable = true;
+          tr.addEventListener("dragstart", (ev) => {
+            // Do not touch the selection here: showing the action bar would push the rows down mid-drag.
+            const names = selected.has(e.name) ? [...selected] : [e.name];
+            ev.dataTransfer.setData(DRAG, JSON.stringify({ dir: cwd, names }));
+            ev.dataTransfer.effectAllowed = copy ? "copyMove" : "move";
+          });
+        }
+        if (e.dir) dropTarget(tr, () => joinPath(cwd, e.name));
+        tr.dataset.fresh = previous && !previous.has(e.name) ? "1" : "";
+        return tr;
       });
-      body.replaceChildren(...(rows.length ? rows : [h("tr", null, h("td", { colspan: "4", class: "muted" }, "Pasta vazia."))]));
+      body.replaceChildren(...(rows.length ? rows : [h("tr", null, h("td", { colspan: "5", class: "muted" }, "Pasta vazia."))]));
+      if (!previous) motion.appear(rows.slice(0, 30), { y: 6, duration: 160, stagger: 18 });
+      else motion.flash(rows.filter((tr) => tr.dataset.fresh));
+      syncSelection();
     } catch (e) { toast(`${machine.name}: ${e.message}`, "err"); pathInput.value = cwd; }
   }
   pathInput.addEventListener("keydown", (e) => { if (e.key === "Enter") go(pathInput.value.trim()); });
 
+  // opOnce runs a single operation on the main channel and returns its reply.
+  const opOnce = (op) => serial(async () => {
+    await main.connect();
+    main.send(op);
+    const f = await main.next();
+    if (!f.msg || f.msg.op !== "done") failWith(f);
+    return f.msg;
+  });
   async function makeFolder() {
     const name = prompt("Nome da nova pasta:");
     if (!name) return;
-    try {
-      await serial(async () => {
-        await connect();
-        sendOp({ op: "mkdir", path: joinPath(cwd, name) });
-        const f = await next();
-        if (!f.msg || f.msg.op !== "done") fail(f);
-      });
-      go(cwd);
-    } catch (e) { toast(e.message, "err"); }
+    try { await opOnce({ op: "mkdir", path: joinPath(cwd, name) }); go(cwd); } catch (e) { toast(e.message, "err"); }
+  }
+  // rowsNamed finds the table rows of the given names in the open folder.
+  const rowsNamed = (names) => [...body.querySelectorAll("input[data-name]")].filter((cb) => names.includes(cb.dataset.name)).map((cb) => cb.closest("tr"));
+  // afterRemoval refreshes the list once the rows of what left the folder have slid away.
+  const afterRemoval = async (jobs) => {
+    const gone = jobs.filter((j) => j.state === "ok").map((j) => j.label.replace(/\/$/, ""));
+    await motion.leave(rowsNamed(gone), { x: 22, y: 0, duration: 170 });
+    go(cwd);
+  };
+
+  // --- move and copy ---
+  const isInternal = (ev) => [...(ev.dataTransfer.types || [])].includes(DRAG);
+
+  // dropTarget makes el accept rows dragged from this list; dest() gives the folder.
+  function dropTarget(el, dest) {
+    el.addEventListener("dragover", (ev) => {
+      if (!isInternal(ev)) return;
+      ev.preventDefault(); ev.stopPropagation();
+      ev.dataTransfer.dropEffect = ev.altKey || ev.ctrlKey ? (copy ? "copy" : "none") : "move";
+      el.classList.add("drop-into");
+    });
+    el.addEventListener("dragleave", () => el.classList.remove("drop-into"));
+    el.addEventListener("drop", (ev) => {
+      el.classList.remove("drop-into");
+      if (!isInternal(ev)) return;
+      ev.preventDefault(); ev.stopPropagation();
+      let data; try { data = JSON.parse(ev.dataTransfer.getData(DRAG)); } catch { return; }
+      const wantCopy = ev.altKey || ev.ctrlKey;
+      if (wantCopy && !copy) { toast(noCopy, "err"); return; }
+      transfer(data.names.map((n) => entries.find((x) => x.name === n)).filter(Boolean), data.dir, dest(), wantCopy);
+    });
+  }
+  dropTarget(upBtn, () => parentPath(cwd));
+
+  async function askDestination(wantCopy) {
+    const items = entries.filter((e) => selected.has(e.name));
+    if (!items.length) return;
+    const dest = (prompt(`${wantCopy ? "Copiar" : "Mover"} ${items.length === 1 ? items[0].name : items.length + " itens"} para a pasta:`, cwd) || "").trim();
+    if (!dest) return;
+    transfer(items, cwd, dest, wantCopy);
+  }
+
+  // transfer moves or copies items (listed in from) into the folder dest, one job each.
+  function transfer(items, from, dest, wantCopy) {
+    dest = dest.replace(/\/+$/, "") || "/";
+    items = items.filter((e) => joinPath(dest, e.name) !== joinPath(from, e.name));
+    if (!items.length) { toast("Os itens já estão nessa pasta.", "err"); return; }
+    const kind = wantCopy ? "cp" : "mv";
+    const added = items.map((e) => newJob(kind, e.name + (e.dir ? "/" : ""), 0, async (j, ch) => {
+      ch.send({ op: kind, path: joinPath(from, e.name), to: joinPath(dest, e.name) });
+      const f = await ch.next();
+      if (!f.msg || f.msg.op !== "done") failWith(f);
+      if (f.msg.skipped) j.note = `${f.msg.skipped} item${f.msg.skipped > 1 ? "s" : ""} ignorado${f.msg.skipped > 1 ? "s" : ""} (links, especiais)`;
+    }));
+    addJobs(added);
+    let last = null;
+    for (const j of added) last = serial(() => execute(j, main));
+    last.then(() => (wantCopy ? go(cwd) : afterRemoval(added)));
+  }
+
+  async function renameSelected() {
+    const old = [...selected][0];
+    if (!old) return;
+    const name = (prompt("Novo nome:", old) || "").trim();
+    if (!name || name === old) return;
+    if (name.includes("/") || name === "." || name === "..") { toast("O nome não pode ter “/”.", "err"); return; }
+    try { await opOnce({ op: "mv", path: joinPath(cwd, old), to: joinPath(cwd, name) }); toast(`Renomeado para ${name}`, "ok"); }
+    catch (e) { toast(`Não foi possível renomear: ${e.message}`, "err"); }
+    go(cwd);
+  }
+  async function deleteSelected() {
+    const items = entries.filter((e) => selected.has(e.name));
+    if (!items.length) return;
+    const folders = items.filter((e) => e.dir).length;
+    const names = items.slice(0, 8).map((e) => h("li", null, (e.dir ? "📁 " : "📄 ") + e.name));
+    const ok = await dialog(items.length === 1 ? "Excluir este item?" : `Excluir ${items.length} itens?`,
+      [h("p", { class: "muted mono", style: "word-break:break-all" }, cwd),
+        h("ul", { class: "del-list" }, ...names, items.length > 8 && h("li", { class: "muted" }, `…e mais ${items.length - 8}`)),
+        folders ? h("div", { class: "warn" }, `${folders === 1 ? "A pasta" : "As pastas"} será${folders > 1 ? "ão" : ""} apagada${folders > 1 ? "s" : ""} com tudo o que há dentro. Não dá para desfazer.`) : h("p", { class: "muted" }, "Não dá para desfazer.")],
+      [{ label: "Cancelar", value: false }, { label: "Excluir", value: true, cls: "danger" }], false);
+    if (!ok) return;
+    const added = items.map((e) => newJob("del", e.name + (e.dir ? "/" : ""), 0, async (j, ch) => {
+      ch.send({ op: "rm", path: joinPath(cwd, e.name), recursive: e.dir });
+      const f = await ch.next();
+      if (!f.msg || f.msg.op !== "done") failWith(f);
+    }));
+    addJobs(added);
+    let last = null;
+    for (const j of added) last = serial(() => execute(j, main));
+    last.then(() => afterRemoval(added));
   }
 
   // --- downloads ---
+  // A download is written straight to disk when the browser can and the file
+  // is large (or a zip, whose size is not known); otherwise it is kept in memory
+  // and saved when complete.
   function download(path, name, size) {
-    const job = newJob("down", name, size || 0, async (j) => {
-      sendOp({ op: "get", path });
-      let f = await next();
-      if (!f.msg || f.msg.op !== "get") fail(f);
-      const total = f.msg.size, parts = [];
-      j.size = total;
-      for (;;) {
-        f = await next();
-        if (f.binary) { parts.push(f.binary); j.done += f.binary.length; scheduleRender(); continue; }
-        if (f.msg && f.msg.op === "done") break;
-        fail(f);
-      }
-      if (j.done !== total) throw new Error(`o arquivo mudou durante o download (${j.done} de ${total} bytes)`);
-      const url = URL.createObjectURL(new Blob(parts));
-      const a = h("a", { href: url, download: name });
-      document.body.append(a); a.click(); a.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60000);
+    pickSaveHandle(name, (size || 0) >= STREAM_MIN).then((handle) => {
+      if (handle === null) return; // the user closed the save dialog
+      const job = newJob("down", name, size || 0, async (j, ch) => {
+        const sink = await openSink(handle, name);
+        try {
+          ch.send({ op: "get", path });
+          let f = await ch.next();
+          if (!f.msg || f.msg.op !== "get") failWith(f);
+          const total = f.msg.size;
+          j.size = total;
+          for (;;) {
+            if (cancelled) { ch.drop(); throw { cancelled: true }; }
+            f = await ch.next();
+            if (f.binary) { await sink.write(f.binary); j.done += f.binary.length; scheduleRender(); continue; }
+            if (f.msg && f.msg.op === "done") break;
+            failWith(f);
+          }
+          if (j.done !== total) throw new Error(`o arquivo mudou durante o download (${j.done} de ${total} bytes)`);
+          await sink.done();
+        } catch (e) { await sink.abort(); throw e; }
+      });
+      addJobs([job]);
+      serial(() => execute(job, main));
     });
-    addJobs([job]);
-    serial(() => execute(job));
+  }
+  function downloadZip(items) {
+    const name = (items.length === 1 ? items[0].name : (cwd.split("/").filter(Boolean).pop() || "arquivos")) + ".zip";
+    pickSaveHandle(name, true).then((handle) => {
+      if (handle === null) return;
+      const job = newJob("down", name, 0, async (j, ch) => {
+        const sink = await openSink(handle, name);
+        try {
+          ch.send({ op: "zip", paths: items.map((e) => joinPath(cwd, e.name)) });
+          let f = await ch.next();
+          if (!f.msg || f.msg.op !== "zip") failWith(f);
+          for (;;) {
+            if (cancelled) { ch.drop(); throw { cancelled: true }; }
+            f = await ch.next();
+            if (f.binary) { await sink.write(f.binary); j.done += f.binary.length; scheduleRender(); continue; }
+            if (f.msg && f.msg.op === "done") break;
+            failWith(f);
+          }
+          if (f.msg.bytes !== j.done) throw new Error(`o arquivo .zip veio incompleto (${j.done} de ${f.msg.bytes} bytes)`);
+          if (f.msg.skipped) j.note = `${f.msg.skipped} ite${f.msg.skipped > 1 ? "ns" : "m"} sem permissão ficou fora`;
+          await sink.done();
+        } catch (e) { await sink.abort(); throw e; }
+      });
+      addJobs([job]);
+      serial(() => execute(job, main));
+    });
+  }
+  function downloadSelected() {
+    const items = entries.filter((e) => selected.has(e.name));
+    if (!items.length) return;
+    if (items.length === 1 && !items[0].dir) download(joinPath(cwd, items[0].name), items[0].name, items[0].size);
+    else if (!manage) toast(noManage, "err");
+    else downloadZip(items);
   }
 
   // --- uploads (files and whole folders) ---
-  async function putFile(j, file, dest) {
+  async function putFile(j, ch, file, dest) {
     let overwrite = conflictPolicy === "replace";
+    const mode = prefs().keepExecutable && (await looksExecutable(file)) ? 0o755 : 0;
+    const mtime = file.lastModified > 0 ? Math.floor(file.lastModified / 1000) : 0;
     for (;;) {
-      sendOp({ op: "put", path: dest, size: file.size, overwrite, parents: true });
-      const f = await next();
+      ch.send({ op: "put", path: dest, size: file.size, overwrite, parents: true, mtime, mode });
+      const f = await ch.next();
       if (f.msg && f.msg.op === "ready") break;
-      if (f.msg && f.msg.op === "error" && /já existe/.test(f.msg.error) && !overwrite) {
-        let choice = conflictPolicy === "skip" ? "skip" : await chooseConflict(dest);
-        if (choice === "replaceAll") { conflictPolicy = "replace"; choice = "replace"; }
-        if (choice === "skipAll") { conflictPolicy = "skip"; choice = "skip"; }
+      if (f.msg && f.msg.op === "error" && (f.msg.code === "exists" || /já existe/.test(f.msg.error)) && !overwrite) {
+        const choice = await resolveConflict(dest);
         if (choice === "replace") { overwrite = true; continue; }
         j.state = "skipped"; j.note = "já existe, pulado";
         return;
       }
-      fail(f);
+      failWith(f);
     }
     for (let off = 0; off < file.size; off += FILE_CHUNK) {
-      if (cancelled) { if (ws) ws.close(); throw { cancelled: true }; } // the agent drops the half-written file
-      if (dead) fail(dead);
-      while (ws.bufferedAmount > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 25));
-      ws.send(await file.slice(off, off + FILE_CHUNK).arrayBuffer());
+      if (cancelled) { ch.drop(); throw { cancelled: true }; } // the agent drops the half-written file
+      if (ch.dead) failWith(ch.dead);
+      while (ch.buffered > 4 * 1024 * 1024) await new Promise((r) => setTimeout(r, 25));
+      ch.ws.send(await file.slice(off, off + FILE_CHUNK).arrayBuffer());
       j.done = Math.min(off + FILE_CHUNK, file.size);
       scheduleRender();
     }
-    sendOp({ op: "end" });
-    const f = await next();
-    if (!f.msg || f.msg.op !== "done") fail(f);
+    ch.send({ op: "end" });
+    const f = await ch.next();
+    if (!f.msg || f.msg.op !== "done") failWith(f);
     j.done = file.size;
+  }
+  // resolveConflict asks once at a time, and remembers "all" answers.
+  function resolveConflict(path) {
+    const run = conflictLock.then(async () => {
+      if (conflictPolicy) return conflictPolicy;
+      const choice = await chooseConflict(path);
+      if (choice === "replaceAll") { conflictPolicy = "replace"; return "replace"; }
+      if (choice === "skipAll") { conflictPolicy = "skip"; return "skip"; }
+      return choice;
+    });
+    conflictLock = run.catch(() => {});
+    return run;
+  }
+  // runPool sends the files with several channels at once, each file on one channel.
+  async function runPool(fileJobs) {
+    const queue = [...fileJobs];
+    const size = Math.max(1, Math.min(prefs().uploadParallel, queue.length));
+    await Promise.all(Array.from({ length: size }, async () => {
+      const ch = new Channel(machine.id);
+      workers.add(ch);
+      try {
+        while (queue.length) await execute(queue.shift(), ch);
+      } finally { ch.close(); workers.delete(ch); }
+    }));
   }
 
   // enqueueUploads sends what was picked or dropped into the open folder,
-  // keeping its structure: folders are created on the way (or, for empty
-  // ones, explicitly) and files go to the same relative path.
-  function enqueueUploads(collected) {
+  // keeping its structure. The folders are created first, then the files go
+  // to the same relative path, several at a time.
+  async function enqueueUploads(collected) {
     const base = cwd;
     if (!base) { toast("Abra uma pasta antes de enviar.", "err"); return; }
-    const added = [];
-    for (const rel of emptyFolders(collected)) {
-      added.push(newJob("dir", rel + "/", 0, async () => {
-        sendOp({ op: "mkdir", path: joinPath(base, rel), parents: true });
-        const f = await next();
-        if (!f.msg || f.msg.op !== "done") fail(f);
-      }));
+    const chosen = await confirmFolderUpload(collected, base);
+    if (!chosen) return;
+    const folders = allFolders(chosen);
+    let foldersFailed = "";
+    let prep = null;
+    if (folders.length) {
+      // Folders are created top-down with plain mkdir, which every agent
+      // version understands. A folder that already exists is fine.
+      prep = newJob("dir", folders.length === 1 ? folders[0] + "/" : `${folders.length} pastas`, 0, async (j, ch) => {
+        try {
+          for (const rel of folders) {
+            if (cancelled) throw { cancelled: true };
+            ch.send({ op: "mkdir", path: joinPath(base, rel), parents: true });
+            const f = await ch.next();
+            if (f.msg && f.msg.op === "done") continue;
+            if (f.msg && f.msg.op === "error" && (f.msg.code === "exists" || /já existe/.test(f.msg.error))) continue;
+            failWith(f);
+          }
+        } catch (e) {
+          if (!e.cancelled) foldersFailed = e.message || String(e);
+          throw e;
+        }
+        j.note = folders.length === 1 ? "pasta pronta" : `${folders.length} pastas prontas`;
+      });
     }
-    for (const { file, rel } of collected.files) {
-      added.push(newJob("up", rel, file.size, (j) => putFile(j, file, joinPath(base, rel))));
-    }
-    if (!added.length) { toast("Nada para enviar.", "err"); return; }
-    addJobs(added);
-    let last = null;
-    for (const j of added) last = serial(() => execute(j));
-    last.then(() => go(cwd));
+    const fileJobs = chosen.files.map(({ file, rel }) => newJob("up", rel, file.size, (j, ch) => {
+      if (foldersFailed) throw new Error(`não foi possível criar as pastas: ${foldersFailed}`);
+      return putFile(j, ch, file, joinPath(base, rel));
+    }));
+    if (!prep && !fileJobs.length) { toast("Nada para enviar.", "err"); return; }
+    addJobs([...(prep ? [prep] : []), ...fileJobs]);
+    if (prep) await serial(() => execute(prep, main));
+    await runPool(fileJobs);
+    go(cwd);
   }
-  picker.addEventListener("change", () => { enqueueUploads(collectPicked(picker.files)); picker.value = ""; });
-  folderPicker.addEventListener("change", () => { enqueueUploads(collectPicked(folderPicker.files)); folderPicker.value = ""; });
-  for (const ev of ["dragenter", "dragover"]) overlay.addEventListener(ev, (e) => { e.preventDefault(); drop.classList.add("over"); });
+  const fromPicker = (input) => () => { const c = collectPicked(input.files); input.value = ""; enqueueUploads(c); };
+  picker.addEventListener("change", fromPicker(picker));
+  folderPicker.addEventListener("change", fromPicker(folderPicker));
+  for (const ev of ["dragenter", "dragover"]) overlay.addEventListener(ev, (e) => { if (isInternal(e)) return; e.preventDefault(); drop.classList.add("over"); });
   overlay.addEventListener("dragleave", (e) => { if (e.target === overlay || e.target === drop) drop.classList.remove("over"); });
   overlay.addEventListener("drop", (e) => {
+    if (isInternal(e)) return;
     e.preventDefault(); drop.classList.remove("over");
     collectDropped(e.dataTransfer).then(enqueueUploads).catch((err) => toast(`Não consegui ler o que foi solto: ${err.message || err}`, "err"));
   });
@@ -1990,7 +2492,8 @@ function openFiles(machine) {
     closed = true; cancelled = true;
     pauseAutoClose();
     document.removeEventListener("keydown", onKey);
-    if (ws) ws.close();
+    main.close();
+    workers.forEach((ch) => ch.close());
     overlay.remove();
   }
   go("");
@@ -2220,7 +2723,7 @@ async function playRecording(rec) {
 (async function boot() {
   try {
     applyMe(await api("GET", "/api/me"));
-    if (sessionReady()) { await refresh(); startPolling(); }
+    if (sessionReady()) { await refresh(); await loadPrefs(); startPolling(); }
   } catch (_) { state.user = null; }
   render();
 })();

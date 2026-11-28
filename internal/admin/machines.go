@@ -32,6 +32,10 @@ type machineView struct {
 	CanSelfUpdate bool `json:"can_self_update"`
 	// CanFiles is true when the connected agent serves file transfer.
 	CanFiles bool `json:"can_files"`
+	// CanFilesManage is true when the agent also deletes, renames and zips.
+	CanFilesManage bool `json:"can_files_manage"`
+	// CanFilesCopy is true when the agent also copies files and folders.
+	CanFilesCopy bool `json:"can_files_copy"`
 }
 
 type machineCreated struct {
@@ -52,8 +56,10 @@ func (s *Server) view(m store.Machine) machineView {
 	online := s.relay.IsOnline(m.ID)
 	return machineView{
 		Machine: m, Online: online,
-		CanSelfUpdate: online && s.relay.AgentHas(m.ID, protocol.CapSelfUpdate),
-		CanFiles:      online && s.files && s.relay.AgentHas(m.ID, protocol.CapFiles),
+		CanSelfUpdate:  online && s.relay.AgentHas(m.ID, protocol.CapSelfUpdate),
+		CanFiles:       online && s.files && s.relay.AgentHas(m.ID, protocol.CapFiles),
+		CanFilesManage: online && s.files && s.relay.AgentHas(m.ID, protocol.CapFilesManage),
+		CanFilesCopy:   online && s.files && s.relay.AgentHas(m.ID, protocol.CapFilesCopy),
 	}
 }
 
@@ -237,7 +243,7 @@ func (s *Server) commands(r *http.Request, machineID, credential, shellUser stri
 
 	// The token goes to curl through stdin (-H @-), so it never shows up in `ps`.
 	fetch := func(osExpr, out string) string {
-		return fmt.Sprintf(`printf 'Authorization: Bearer %%s\n' "$TOKEN" | curl -fsSL -H @- "%s/download/agent/%s-$ARCH" -o %s`, base, osExpr, out)
+		return fmt.Sprintf(`rm -f %[3]s; printf 'Authorization: Bearer %%s\n' "$TOKEN" | curl -fsSL --retry 8 --retry-all-errors --retry-delay 2 --connect-timeout 15 --speed-limit 1000 --speed-time 20 -C - -H @- "%[1]s/download/agent/%[2]s-$ARCH" -o %[3]s`, base, osExpr, out)
 	}
 	return Commands{
 		Downloads: true,

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"time"
 
@@ -89,9 +90,34 @@ type fileMonitor struct {
 }
 
 type fileOp struct {
-	kind  string // protocol.OpPut, OpGet or OpMkdir
-	path  string
+	kind  string // protocol.OpPut, OpGet, OpMkdir, OpRm, OpMv or OpZip
+	path  string // what the operation is about, as shown in the audit
 	bytes int64
+}
+
+// audited maps the operations that change or move data to their audit action.
+var auditedOps = map[string]string{
+	protocol.OpPut: "file_upload", protocol.OpGet: "file_download", protocol.OpMkdir: "file_mkdir",
+	protocol.OpRm: "file_delete", protocol.OpMv: "file_rename", protocol.OpCp: "file_copy", protocol.OpZip: "file_download",
+}
+
+// opLabel describes an operation for the audit trail.
+func opLabel(msg protocol.FileMessage) string {
+	switch msg.Op {
+	case protocol.OpMv, protocol.OpCp:
+		return msg.Path + " -> " + msg.To
+	case protocol.OpRm:
+		if msg.Recursive {
+			return msg.Path + " (recursive)"
+		}
+	case protocol.OpZip:
+		label := "zip: " + strings.Join(msg.Paths, ", ")
+		if len(label) > 400 {
+			label = label[:400] + fmt.Sprintf("… (%d items)", len(msg.Paths))
+		}
+		return label
+	}
+	return msg.Path
 }
 
 func (m *fileMonitor) Message(fromAgent bool, messageType int, data []byte) error {
@@ -113,11 +139,11 @@ func (m *fileMonitor) Message(fromAgent bool, messageType int, data []byte) erro
 	}
 	if !fromAgent {
 		switch msg.Op {
-		case protocol.OpPut, protocol.OpGet, protocol.OpMkdir:
+		case protocol.OpPut, protocol.OpGet, protocol.OpMkdir, protocol.OpRm, protocol.OpMv, protocol.OpCp, protocol.OpZip:
 			if m.op != nil {
 				m.fail("replaced by another operation")
 			}
-			m.op = &fileOp{kind: msg.Op, path: msg.Path}
+			m.op = &fileOp{kind: msg.Op, path: opLabel(msg)}
 			if msg.Op == protocol.OpPut && m.limit > 0 && msg.Size > m.limit {
 				m.fail("larger than the limit")
 				return fmt.Errorf("file larger than the limit of %d MB", m.limit>>20)
@@ -135,17 +161,29 @@ func (m *fileMonitor) Message(fromAgent bool, messageType int, data []byte) erro
 		if m.op == nil {
 			return nil
 		}
-		action := map[string]string{protocol.OpPut: "file_upload", protocol.OpGet: "file_download", protocol.OpMkdir: "file_mkdir"}[m.op.kind]
 		detail := m.op.path
-		if m.op.kind != protocol.OpMkdir {
+		switch m.op.kind {
+		case protocol.OpPut, protocol.OpGet:
 			detail = fmt.Sprintf("%s (%d bytes)", m.op.path, m.op.bytes)
+		case protocol.OpZip:
+			detail = fmt.Sprintf("%s (%d bytes", m.op.path, m.op.bytes)
+			if msg.Skipped > 0 {
+				detail += fmt.Sprintf(", %d items skipped", msg.Skipped)
+			}
+			detail += ")"
 		}
-		m.s.audit(m.actor, action, m.machineID, detail)
+		m.s.audit(m.actor, auditedOps[m.op.kind], m.machineID, detail)
 		m.op = nil
 	case protocol.OpError:
-		if m.op != nil {
-			m.fail(msg.Error)
+		if m.op == nil {
+			return nil
 		}
+		if (m.op.kind == protocol.OpMkdir || m.op.kind == protocol.OpPut) && msg.Code == protocol.CodeExists {
+			m.op = nil // a folder that is already there is expected when a tree is sent again, and a file that is
+			// there only makes the panel ask whether to replace it; neither is a failure
+			return nil
+		}
+		m.fail(msg.Error)
 	}
 	return nil
 }
